@@ -93,6 +93,8 @@ class ReplicationOrchestrator:
 
         self.temp_dir = tempfile.TemporaryDirectory()
         self.secrets_path = Path(self.temp_dir.name) / "datasphere_secrets.json"
+        self.template = {}
+        self.access_token = None
         
         # Results tracking
         self.results = {}
@@ -212,6 +214,7 @@ class ReplicationOrchestrator:
                 token_resp = json.loads(resp.read().decode())
                 access_token = token_resp.get("access_token")
                 if access_token:
+                    self.access_token = access_token
                     log("AUTH", "Successfully pre-fetched OAuth2 access token for technical user.")
         except Exception as e:
             # Fallback attempt with credentials in POST body
@@ -348,16 +351,76 @@ class ReplicationOrchestrator:
 
         return {}
 
-    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str, style: str = "replicationFlow") -> dict:
+    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str, style: str = "csn_standard") -> dict:
         """
         Builds the SAP Datasphere Replication Flow JSON definition.
-        Supports both modern replicationFlow schema and entity notation.
+        Ensures valid CSN format with $version and required entity/flow metadata.
         """
         load_type = self.get_load_type_name()
-        
-        if style == "replicationFlow":
-            # Standard SAP Datasphere replicationFlow schema
+
+        if style == "template" and self.template and "definitions" in self.template:
+            import copy
+            t_def = copy.deepcopy(self.template)
+            t_def["$version"] = t_def.get("$version", "2.0")
+            old_keys = list(t_def["definitions"].keys())
+            if old_keys:
+                old_key = old_keys[0]
+                flow_body = t_def["definitions"].pop(old_key)
+                
+                target_block = flow_body.get("element") or flow_body.get("elements") or {}
+                if "sourceConnection" in target_block:
+                    target_block["sourceConnection"] = self.source_conn
+                if "targetConnection" in target_block:
+                    target_block["targetConnection"] = self.target_conn
+                if "loadType" in target_block:
+                    target_block["loadType"] = load_type
+                
+                sources = target_block.get("sources", [])
+                if sources and isinstance(sources, list):
+                    sources[0]["container"] = self.source_container
+                    sources[0]["objects"] = [{"name": view_name, "targetName": table_name}]
+                
+                new_key = f"{self.source_space}.{flow_name}" if "." in old_key else flow_name
+                t_def["definitions"][new_key] = flow_body
+                return t_def
+
+        if style == "csn_standard":
+            # Official SAP Datasphere CSN entity notation
             return {
+                "$version": "2.0",
+                "definitions": {
+                    flow_name: {
+                        "kind": "entity",
+                        "@datasphere.flow.type": "Replication",
+                        "elements": {
+                            "sourceConnection": {
+                                "type": "cds.String",
+                                "@datasphere.connectionId": self.source_conn
+                            },
+                            "sourceContainer": {
+                                "type": "cds.String",
+                                "@datasphere.containerId": self.source_container
+                            },
+                            "targetConnection": {
+                                "type": "cds.String",
+                                "@datasphere.connectionId": self.target_conn
+                            },
+                            "replicationObjects": [
+                                {
+                                    "sourceObject": view_name,
+                                    "targetObject": table_name,
+                                    "loadType": load_type
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+
+        elif style == "replicationFlow":
+            # SAP Datasphere native replicationFlow CSN definition
+            return {
+                "$version": "2.0",
                 "definitions": {
                     flow_name: {
                         "kind": "replicationFlow",
@@ -380,36 +443,13 @@ class ReplicationOrchestrator:
                     }
                 }
             }
-        elif style == "replicationFlow_elements":
-            # Variant using 'elements' plural
-            return {
-                "definitions": {
-                    flow_name: {
-                        "kind": "replicationFlow",
-                        "elements": {
-                            "sourceConnection": self.source_conn,
-                            "targetConnection": self.target_conn,
-                            "loadType": load_type,
-                            "sources": [
-                                {
-                                    "container": self.source_container,
-                                    "objects": [
-                                        {
-                                            "name": view_name,
-                                            "targetName": table_name
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
+
         else:
-            # CSN Entity notation without space prefix in definition key
+            # CSN definition with space-qualified key
             return {
+                "$version": "2.0",
                 "definitions": {
-                    flow_name: {
+                    f"{self.source_space}.{flow_name}": {
                         "kind": "entity",
                         "@datasphere.flow.type": "Replication",
                         "elements": {
@@ -453,7 +493,10 @@ class ReplicationOrchestrator:
         action = "update" if exists else "create"
         log("FLOW", f"{action.capitalize()}ing Replication Flow '{flow_name}' for CDS View '{view_name}'...")
 
-        styles_to_try = ["replicationFlow", "replicationFlow_elements", "entity"]
+        styles_to_try = []
+        if self.template:
+            styles_to_try.append("template")
+        styles_to_try.extend(["csn_standard", "replicationFlow", "csn_space_prefixed"])
         for style in styles_to_try:
             flow_json = self.build_flow_definition(flow_name, view_name, table_name, style=style)
             flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
@@ -461,6 +504,31 @@ class ReplicationOrchestrator:
                 json.dump(flow_json, f, indent=2)
 
             log("FLOW", f"Attempting {action} with schema style '{style}'...")
+
+            # 1. Try direct REST API if bearer access token is available
+            if self.access_token:
+                try:
+                    endpoint_action = f"/{flow_name}" if action == "update" else ""
+                    method = "PUT" if action == "update" else "POST"
+                    rest_url = f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/replicationflows{endpoint_action}?deploy=true"
+                    headers = {
+                        "Authorization": f"Bearer {self.access_token}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, application/vnd.sap.datasphere.object.content+json"
+                    }
+                    data_bytes = json.dumps(flow_json).encode("utf-8")
+                    req = urllib.request.Request(rest_url, data=data_bytes, headers=headers, method=method)
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        if resp.status in (200, 201, 204):
+                            log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed via direct REST API (schema style: {style}).")
+                            return True
+                except urllib.error.HTTPError as he:
+                    err_body = he.read().decode() if he.fp else str(he)
+                    log("FLOW", f"Direct REST API HTTP {he.code} for style '{style}': {err_body}", "WARN")
+                except Exception as ex:
+                    log("FLOW", f"Direct REST API notice for style '{style}': {ex}", "WARN")
+
+            # 2. Try @sap/datasphere-cli command
             cmd = [
                 "datasphere", "objects", "replication-flows", action,
                 "--space", self.source_space,
@@ -707,6 +775,7 @@ class ReplicationOrchestrator:
 
             self.authenticate_datasphere()
             self.validate_connection()
+            self.template = self.discover_existing_template()
 
             for view in views_to_process:
                 flow_name = f"{self.flow_prefix}{view}"
