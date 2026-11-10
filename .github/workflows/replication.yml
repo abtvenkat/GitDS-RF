@@ -1,0 +1,71 @@
+name: SAP Datasphere Replication Flows
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cds_views.txt'
+  workflow_dispatch:
+    inputs:
+      force_all:
+        description: 'Force replication of all CDS Views (bypasses change detection)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: datasphere-replication-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  replicate:
+    name: Automate Replication Flows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install SAP Datasphere CLI
+        run: |
+          npm install -g @sap/datasphere-cli
+          datasphere --version
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run SAP Datasphere Replication Orchestrator
+        env:
+          DATASPHERE_HOST: ${{ secrets.DATASPHERE_HOST }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          AUTHORIZATION_URL: ${{ secrets.AUTHORIZATION_URL }}
+          TOKEN_URL: ${{ secrets.TOKEN_URL }}
+          SOURCE_SPACE: ${{ vars.SOURCE_SPACE || secrets.SOURCE_SPACE }}
+          SOURCE_CONNECTION: ${{ vars.SOURCE_CONNECTION || secrets.SOURCE_CONNECTION }}
+          SOURCE_CONTAINER: ${{ vars.SOURCE_CONTAINER || secrets.SOURCE_CONTAINER || 'CDS_EXTRACTION' }}
+          CONSUMER_SPACES: ${{ vars.CONSUMER_SPACES || secrets.CONSUMER_SPACES || '' }}
+          LOAD_TYPE: ${{ vars.LOAD_TYPE || secrets.LOAD_TYPE || 'INITIAL' }}
+          FORCE_REPLICATE_ALL: ${{ github.event.inputs.force_all || 'false' }}
+          STATUS_TIMEOUT_SEC: ${{ vars.STATUS_TIMEOUT_SEC || '600' }}
+          STATUS_POLL_INTERVAL_SEC: ${{ vars.STATUS_POLL_INTERVAL_SEC || '15' }}
+        run: |
+          python scripts/replication_orchestrator.py --cds-file cds_views.txt
+
+      - name: Upload Replication Execution Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datasphere-replication-reports
+          path: reports/
+          retention-days: 30
