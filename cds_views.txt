@@ -3,7 +3,5 @@
 # Enter one CDS View technical name per line.
 # Blank lines and lines starting with '#' are ignored.
 
-I_SALESORDER
-I_SALESORDERITEM
-I_CUSTOMER
-I_PRODUCT
+I_CURRENCY
+I_CURRENCYTEXT
