@@ -66,6 +66,7 @@ Go to your GitHub repository: **Settings** → **Secrets and variables** → **A
 | `SOURCE_SPACE` | Technical ID of the source Datasphere space | `SALES_SPACE` | *(Required)* |
 | `SOURCE_CONNECTION` | Technical ID of the source connection | `S4HANA_CONN` | *(Required)* |
 | `SOURCE_CONTAINER` | Source container/namespace | `CDS_EXTRACTION` | `CDS_EXTRACTION` |
+| `TARGET_CONNECTION` | Target connection technical ID | `DATASPHERE_LOCAL` | `DATASPHERE_LOCAL` |
 | `CONSUMER_SPACES` | Comma-separated list of target spaces to share local tables | `ANALYTICS_SPACE,FINANCE_SPACE` | *(Optional)* |
 | `LOAD_TYPE` | Replication load mode (`INITIAL` or `INITIAL_AND_DELTA`) | `INITIAL` | `INITIAL` |
 | `STATUS_TIMEOUT_SEC` | Maximum seconds to wait for flow run completion | `600` | `600` |

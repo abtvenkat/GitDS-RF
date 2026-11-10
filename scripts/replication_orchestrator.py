@@ -74,6 +74,7 @@ class ReplicationOrchestrator:
         self.source_space = os.getenv("SOURCE_SPACE", "").strip()
         self.source_conn = os.getenv("SOURCE_CONNECTION", "").strip()
         self.source_container = os.getenv("SOURCE_CONTAINER", "CDS_EXTRACTION").strip()
+        self.target_conn = os.getenv("TARGET_CONNECTION", "DATASPHERE_LOCAL").strip()
         self.load_type = os.getenv("LOAD_TYPE", "INITIAL").strip().upper()
         self.flow_prefix = os.getenv("FLOW_PREFIX", "RF_").strip()
         self.table_prefix = os.getenv("TABLE_PREFIX", "LT_").strip()
@@ -256,7 +257,7 @@ class ReplicationOrchestrator:
                         },
                         "targetConnection": {
                             "type": "cds.String",
-                            "@datasphere.connectionId": "DATASPHERE_LOCAL"
+                            "@datasphere.connectionId": self.target_conn
                         },
                         "replicationObjects": [
                             {

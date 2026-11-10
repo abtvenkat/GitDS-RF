@@ -54,6 +54,7 @@ jobs:
           SOURCE_SPACE: ${{ vars.SOURCE_SPACE || secrets.SOURCE_SPACE }}
           SOURCE_CONNECTION: ${{ vars.SOURCE_CONNECTION || secrets.SOURCE_CONNECTION }}
           SOURCE_CONTAINER: ${{ vars.SOURCE_CONTAINER || secrets.SOURCE_CONTAINER || 'CDS_EXTRACTION' }}
+          TARGET_CONNECTION: ${{ vars.TARGET_CONNECTION || secrets.TARGET_CONNECTION || 'DATASPHERE_LOCAL' }}
           CONSUMER_SPACES: ${{ vars.CONSUMER_SPACES || secrets.CONSUMER_SPACES || '' }}
           LOAD_TYPE: ${{ vars.LOAD_TYPE || secrets.LOAD_TYPE || 'INITIAL' }}
           FORCE_REPLICATE_ALL: ${{ github.event.inputs.force_all || 'false' }}
