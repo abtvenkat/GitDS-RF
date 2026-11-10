@@ -290,40 +290,152 @@ class ReplicationOrchestrator:
             else:
                 log("VALIDATE", f"Connection '{self.source_conn}' not explicitly found in listing output; will attempt replication flow execution.", "WARN")
 
-    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str) -> dict:
+    def get_load_type_name(self) -> str:
+        if "DELTA" in self.load_type:
+            return "InitialAndDelta"
+        return "InitialOnly"
+
+    def discover_existing_template(self) -> dict:
         """
-        Builds the standard SAP Datasphere Replication Flow CSN/JSON definition.
+        Attempts to discover and read an existing replication flow in the space
+        to learn the exact schema used by this Datasphere tenant.
         """
-        definition = {
-            "definitions": {
-                f"{self.source_space}.{flow_name}": {
-                    "kind": "entity",
-                    "@datasphere.flow.type": "Replication",
-                    "elements": {
-                        "sourceConnection": {
-                            "type": "cds.String",
-                            "@datasphere.connectionId": self.source_conn
-                        },
-                        "sourceContainer": {
-                            "type": "cds.String",
-                            "@datasphere.containerId": self.source_container
-                        },
-                        "targetConnection": {
-                            "type": "cds.String",
-                            "@datasphere.connectionId": self.target_conn
-                        },
-                        "replicationObjects": [
-                            {
-                                "sourceObject": view_name,
-                                "targetObject": table_name,
-                                "loadType": self.load_type
-                            }
+        log("TEMPLATE", f"Checking for existing Replication Flows in space '{self.source_space}' to derive schema template...")
+        list_cmd = [
+            "datasphere", "objects", "replication-flows", "list",
+            "--space", self.source_space,
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host
+        ]
+        res = run_cmd(list_cmd)
+        if res.returncode == 0 and res.stdout:
+            try:
+                # Output might be JSON list or lines
+                lines = res.stdout.strip().splitlines()
+                flow_names = []
+                for line in lines:
+                    line_str = line.strip()
+                    if line_str and not line_str.startswith("{") and not line_str.startswith("["):
+                        flow_names.append(line_str.split()[0])
+                    elif line_str.startswith("["):
+                        data = json.loads(line_str)
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict):
+                                    flow_names.append(item.get("technicalName") or item.get("name") or "")
+                                elif isinstance(item, str):
+                                    flow_names.append(item)
+
+                for name in flow_names:
+                    if name and not name.startswith("RF_"):
+                        read_cmd = [
+                            "datasphere", "objects", "replication-flows", "read",
+                            "--space", self.source_space,
+                            "--technical-name", name,
+                            "--secrets-file", str(self.secrets_path),
+                            "--host", self.host
                         ]
+                        r_res = run_cmd(read_cmd)
+                        if r_res.returncode == 0 and r_res.stdout:
+                            try:
+                                template_json = json.loads(r_res.stdout)
+                                log("TEMPLATE", f"Discovered existing Replication Flow template '{name}'.")
+                                return template_json
+                            except Exception:
+                                pass
+            except Exception as e:
+                log("TEMPLATE", f"Note during template discovery: {e}", "WARN")
+
+        return {}
+
+    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str, style: str = "replicationFlow") -> dict:
+        """
+        Builds the SAP Datasphere Replication Flow JSON definition.
+        Supports both modern replicationFlow schema and entity notation.
+        """
+        load_type = self.get_load_type_name()
+        
+        if style == "replicationFlow":
+            # Standard SAP Datasphere replicationFlow schema
+            return {
+                "definitions": {
+                    flow_name: {
+                        "kind": "replicationFlow",
+                        "element": {
+                            "sourceConnection": self.source_conn,
+                            "targetConnection": self.target_conn,
+                            "loadType": load_type,
+                            "sources": [
+                                {
+                                    "container": self.source_container,
+                                    "objects": [
+                                        {
+                                            "name": view_name,
+                                            "targetName": table_name
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
                     }
                 }
             }
-        }
-        return definition
+        elif style == "replicationFlow_elements":
+            # Variant using 'elements' plural
+            return {
+                "definitions": {
+                    flow_name: {
+                        "kind": "replicationFlow",
+                        "elements": {
+                            "sourceConnection": self.source_conn,
+                            "targetConnection": self.target_conn,
+                            "loadType": load_type,
+                            "sources": [
+                                {
+                                    "container": self.source_container,
+                                    "objects": [
+                                        {
+                                            "name": view_name,
+                                            "targetName": table_name
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        else:
+            # CSN Entity notation without space prefix in definition key
+            return {
+                "definitions": {
+                    flow_name: {
+                        "kind": "entity",
+                        "@datasphere.flow.type": "Replication",
+                        "elements": {
+                            "sourceConnection": {
+                                "type": "cds.String",
+                                "@datasphere.connectionId": self.source_conn
+                            },
+                            "sourceContainer": {
+                                "type": "cds.String",
+                                "@datasphere.containerId": self.source_container
+                            },
+                            "targetConnection": {
+                                "type": "cds.String",
+                                "@datasphere.connectionId": self.target_conn
+                            },
+                            "replicationObjects": [
+                                {
+                                    "sourceObject": view_name,
+                                    "targetObject": table_name,
+                                    "loadType": load_type
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
 
     def check_flow_exists(self, flow_name: str) -> bool:
         cmd = [
@@ -337,31 +449,37 @@ class ReplicationOrchestrator:
         return res.returncode == 0
 
     def create_or_update_flow(self, flow_name: str, view_name: str, table_name: str) -> bool:
-        flow_json = self.build_flow_definition(flow_name, view_name, table_name)
-        flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
-        with open(flow_file, "w", encoding="utf-8") as f:
-            json.dump(flow_json, f, indent=2)
-
         exists = self.check_flow_exists(flow_name)
         action = "update" if exists else "create"
         log("FLOW", f"{action.capitalize()}ing Replication Flow '{flow_name}' for CDS View '{view_name}'...")
 
-        cmd = [
-            "datasphere", "objects", "replication-flows", action,
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(flow_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        res = run_cmd(cmd)
-        if res.returncode != 0:
-            err = res.stderr or res.stdout
-            log("FLOW", f"Failed to {action} Replication Flow '{flow_name}': {err}", "ERROR")
-            return False
+        styles_to_try = ["replicationFlow", "replicationFlow_elements", "entity"]
+        for style in styles_to_try:
+            flow_json = self.build_flow_definition(flow_name, view_name, table_name, style=style)
+            flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
+            with open(flow_file, "w", encoding="utf-8") as f:
+                json.dump(flow_json, f, indent=2)
 
-        log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed.")
-        return True
+            log("FLOW", f"Attempting {action} with schema style '{style}'...")
+            cmd = [
+                "datasphere", "objects", "replication-flows", action,
+                "--space", self.source_space,
+                "--technical-name", flow_name,
+                "--file-path", str(flow_file),
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host,
+                "--verbose"
+            ]
+            res = run_cmd(cmd)
+            if res.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed (schema style: {style}).")
+                return True
+            else:
+                err = res.stderr or res.stdout
+                log("FLOW", f"Style '{style}' failed: {err}", "WARN")
+
+        log("FLOW", f"All schema styles failed to {action} Replication Flow '{flow_name}'.", "ERROR")
+        return False
 
     def execute_flow(self, flow_name: str) -> bool:
         log("RUN", f"Triggering execution of Replication Flow '{flow_name}'...")
