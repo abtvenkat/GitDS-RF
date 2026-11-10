@@ -51,6 +51,7 @@ jobs:
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           AUTHORIZATION_URL: ${{ secrets.AUTHORIZATION_URL }}
           TOKEN_URL: ${{ secrets.TOKEN_URL }}
+          AUTHORIZATION_FLOW: ${{ vars.AUTHORIZATION_FLOW || 'client_credentials' }}
           SOURCE_SPACE: ${{ vars.SOURCE_SPACE || secrets.SOURCE_SPACE }}
           SOURCE_CONNECTION: ${{ vars.SOURCE_CONNECTION || secrets.SOURCE_CONNECTION }}
           SOURCE_CONTAINER: ${{ vars.SOURCE_CONTAINER || secrets.SOURCE_CONTAINER || 'CDS_EXTRACTION' }}

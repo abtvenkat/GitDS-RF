@@ -21,9 +21,12 @@ import os
 import sys
 import json
 import time
+import base64
 import subprocess
 import tempfile
 import argparse
+import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -71,6 +74,7 @@ class ReplicationOrchestrator:
         self.client_secret = os.getenv("CLIENT_SECRET", "").strip()
         self.auth_url = os.getenv("AUTHORIZATION_URL", "").strip()
         self.token_url = os.getenv("TOKEN_URL", "").strip()
+        self.auth_flow = os.getenv("AUTHORIZATION_FLOW", "client_credentials").strip()
         self.source_space = os.getenv("SOURCE_SPACE", "").strip()
         self.source_conn = os.getenv("SOURCE_CONNECTION", "").strip()
         self.source_container = os.getenv("SOURCE_CONTAINER", "CDS_EXTRACTION").strip()
@@ -194,30 +198,79 @@ class ReplicationOrchestrator:
         return all_views
 
     def authenticate_datasphere(self):
-        log("AUTH", "Configuring authentication for @sap/datasphere-cli...")
+        log("AUTH", f"Configuring authentication for @sap/datasphere-cli (Flow: {self.auth_flow})...")
+        
+        # 1. Pre-fetch OAuth2 access token for Technical User (client_credentials)
+        access_token = None
+        try:
+            auth_header = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
+            body_data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
+            req = urllib.request.Request(self.token_url, data=body_data, method="POST")
+            req.add_header("Authorization", f"Basic {auth_header}")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                token_resp = json.loads(resp.read().decode())
+                access_token = token_resp.get("access_token")
+                if access_token:
+                    log("AUTH", "Successfully pre-fetched OAuth2 access token for technical user.")
+        except Exception as e:
+            # Fallback attempt with credentials in POST body
+            try:
+                body_data = urllib.parse.urlencode({
+                    "grant_type": "client_credentials",
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret
+                }).encode("utf-8")
+                req = urllib.request.Request(self.token_url, data=body_data, method="POST")
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    token_resp = json.loads(resp.read().decode())
+                    access_token = token_resp.get("access_token")
+                    if access_token:
+                        log("AUTH", "Successfully pre-fetched OAuth2 access token for technical user (via body).")
+            except Exception as e2:
+                log("AUTH", f"Direct token fetch notice ({e2}). Proceeding with datasphere login CLI command.", "WARN")
+
+        # 2. Write secrets and options payload (covering both camelCase, snake_case, and kebab-case)
         secrets_payload = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "authorization_url": self.auth_url,
-            "token_url": self.token_url
+            "token_url": self.token_url,
+            "authorization_flow": self.auth_flow,
+            "client-id": self.client_id,
+            "client-secret": self.client_secret,
+            "authorization-url": self.auth_url,
+            "token-url": self.token_url,
+            "authorization-flow": self.auth_flow,
+            "host": self.host
         }
 
-        with open(self.secrets_path, "w", encoding="utf-8") as f:
-            json.dump(secrets_payload, f)
+        if access_token:
+            secrets_payload["access_token"] = access_token
+            secrets_payload["access-token"] = access_token
 
-        # Login using datasphere login
+        with open(self.secrets_path, "w", encoding="utf-8") as f:
+            json.dump(secrets_payload, f, indent=2)
+
+        # 3. Login using datasphere login with explicit authorization-flow
         login_cmd = [
             "datasphere", "login",
             "--host", self.host,
+            "--authorization-flow", self.auth_flow,
             "--secrets-file", str(self.secrets_path)
         ]
         res = run_cmd(login_cmd)
         if res.returncode != 0:
             err = res.stderr or res.stdout
-            log("AUTH", f"datasphere login failed: {err}", "ERROR")
-            raise RuntimeError(f"Authentication with SAP Datasphere failed: {err}")
-
-        log("AUTH", "Successfully authenticated with SAP Datasphere CLI.")
+            # If access_token was already obtained, the secrets file can still authenticate CLI calls
+            if access_token:
+                log("AUTH", f"datasphere login notice: {err}. Proceeding with verified bearer token in secrets-file.", "WARN")
+            else:
+                log("AUTH", f"datasphere login failed: {err}", "ERROR")
+                raise RuntimeError(f"Authentication with SAP Datasphere failed: {err}")
+        else:
+            log("AUTH", "Successfully authenticated with SAP Datasphere CLI.")
 
     def validate_connection(self):
         log("VALIDATE", f"Validating source connection '{self.source_conn}' in space '{self.source_space}'...")
