@@ -298,66 +298,7 @@ class ReplicationOrchestrator:
             return "InitialAndDelta"
         return "InitialOnly"
 
-    def discover_existing_template(self) -> dict:
-        """
-        Attempts to discover and read an existing replication flow in the space
-        to learn the exact schema used by this Datasphere tenant.
-        """
-        spaces_to_check = [self.source_space] + [s for s in self.consumer_spaces if s != self.source_space]
-        for space in spaces_to_check:
-            log("TEMPLATE", f"Checking for existing Replication Flows in space '{space}' to derive schema template...")
-            list_cmd = [
-                "datasphere", "objects", "replication-flows", "list",
-                "--space", space,
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host
-            ]
-            res = run_cmd(list_cmd)
-            raw_out = (res.stdout or "").strip()
-            log("TEMPLATE", f"Flows list response in '{space}': {raw_out}")
-
-            if res.returncode == 0 and raw_out:
-                flow_names = []
-                try:
-                    data = json.loads(raw_out)
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict):
-                                name = item.get("technicalName") or item.get("name") or item.get("id") or ""
-                                if name:
-                                    flow_names.append(name)
-                            elif isinstance(item, str) and item.strip():
-                                flow_names.append(item.strip())
-                    elif isinstance(data, dict):
-                        for k in data.keys():
-                            flow_names.append(k)
-                except Exception:
-                    for line in raw_out.splitlines():
-                        line_str = line.strip()
-                        if line_str and not line_str.startswith("[") and not line_str.startswith("{") and not line_str.startswith("]"):
-                            flow_names.append(line_str.split()[0])
-
-                log("TEMPLATE", f"Identified flow candidates in '{space}': {flow_names}")
-                for name in flow_names:
-                    read_cmd = [
-                        "datasphere", "objects", "replication-flows", "read",
-                        "--space", space,
-                        "--technical-name", name,
-                        "--secrets-file", str(self.secrets_path),
-                        "--host", self.host
-                    ]
-                    r_res = run_cmd(read_cmd)
-                    if r_res.returncode == 0 and r_res.stdout:
-                        try:
-                            template_json = json.loads(r_res.stdout)
-                            log("TEMPLATE", f"Discovered existing template '{name}' in space '{space}':\n{json.dumps(template_json, indent=2)}")
-                            return template_json
-                        except Exception as e:
-                            log("TEMPLATE", f"Could not parse template '{name}': {e}", "WARN")
-
-        return {}
-
-    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str, style: str = "sap_dis_replicationflow") -> dict:
+    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str) -> dict:
         """
         Builds the SAP Datasphere Replication Flow JSON definition.
         Strictly conforms to official SAP Datasphere CSN specification:
@@ -370,7 +311,6 @@ class ReplicationOrchestrator:
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
         source_container = f"/{self.source_container.lstrip('/')}"
 
-        # Standard official sap.dis.replicationflow body
         flow_body = {
             "kind": "sap.dis.replicationflow",
             "@EndUserText.label": flow_name,
@@ -446,87 +386,19 @@ class ReplicationOrchestrator:
             }
         }
 
-        if style == "template" and self.template and "replicationflows" in self.template:
-            import copy
-            t_def = copy.deepcopy(self.template)
-            t_flows = t_def["replicationflows"]
-            old_flow_key = list(t_flows.keys())[0] if t_flows else "TEMPLATE_FLOW"
-            t_body = t_flows.pop(old_flow_key, copy.deepcopy(flow_body))
-            t_body["@EndUserText.label"] = flow_name
-            if "contents" in t_body:
-                t_body["contents"]["description"] = flow_name
-                if "sourceSystem" in t_body["contents"] and t_body["contents"]["sourceSystem"]:
-                    t_body["contents"]["sourceSystem"][0]["connectionId"] = self.source_conn
-                    t_body["contents"]["sourceSystem"][0]["container"] = source_container
-                if "targetSystem" in t_body["contents"] and t_body["contents"]["targetSystem"]:
-                    t_body["contents"]["targetSystem"][0]["connectionId"] = target_conn_id
-                t_body["contents"]["replicationTasks"] = [
-                    {
-                        "name": "replicationtask1",
-                        "loadType": load_type_val,
-                        "priority": 50,
-                        "truncate": False,
-                        "sourceObject": {
-                            "name": view_name,
-                            "businessName": view_name
-                        },
-                        "targetObject": {
-                            "name": table_name,
-                            "businessName": table_name
-                        }
-                    }
-                ]
-            t_body["targets"] = {table_name: {"elements": {}}}
-            t_body["connections"] = {self.source_conn: {}}
-            t_def["replicationflows"] = {flow_name: t_body}
-            t_def["definitions"] = {}
-            t_def["$version"] = "1.0"
-            return t_def
-
-        elif style == "space_prefixed_flow":
-            return {
-                "$version": "1.0",
-                "version": {
-                    "csn": "1.0"
-                },
-                "meta": {
-                    "creator": "CDS Compiler v1.19.2"
-                },
-                "definitions": {},
-                "replicationflows": {
-                    f"{self.source_space}.{flow_name}": flow_body
-                }
+        return {
+            "$version": "1.0",
+            "version": {
+                "csn": "1.0"
+            },
+            "meta": {
+                "creator": "CDS Compiler v1.19.2"
+            },
+            "definitions": {},
+            "replicationflows": {
+                flow_name: flow_body
             }
-
-        elif style == "version_2_sap_dis_flow":
-            return {
-                "$version": "2.0",
-                "version": {
-                    "csn": "1.0"
-                },
-                "meta": {
-                    "creator": "CDS Compiler v1.19.2"
-                },
-                "definitions": {},
-                "replicationflows": {
-                    flow_name: flow_body
-                }
-            }
-
-        else:  # default "sap_dis_replicationflow"
-            return {
-                "$version": "1.0",
-                "version": {
-                    "csn": "1.0"
-                },
-                "meta": {
-                    "creator": "CDS Compiler v1.19.2"
-                },
-                "definitions": {},
-                "replicationflows": {
-                    flow_name: flow_body
-                }
-            }
+        }
 
     def check_flow_exists(self, flow_name: str) -> bool:
         cmd = [
@@ -544,77 +416,58 @@ class ReplicationOrchestrator:
         action = "update" if exists else "create"
         log("FLOW", f"{action.capitalize()}ing Replication Flow '{flow_name}' for CDS View '{view_name}'...")
 
-        styles_to_try = [
-            "sap_dis_replicationflow",
-            "template",
-            "space_prefixed_flow",
-            "version_2_sap_dis_flow"
+        flow_json = self.build_flow_definition(flow_name, view_name, table_name)
+        flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
+        with open(flow_file, "w", encoding="utf-8") as f:
+            json.dump(flow_json, f, indent=2)
+
+        # 1. Execute primary action (create or update) via CLI
+        cmd = [
+            "datasphere", "objects", "replication-flows", action,
+            "--space", self.source_space,
+            "--technical-name", flow_name,
+            "--file-path", str(flow_file),
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host
         ]
-        for style in styles_to_try:
-            flow_json = self.build_flow_definition(flow_name, view_name, table_name, style=style)
-            flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
-            with open(flow_file, "w", encoding="utf-8") as f:
-                json.dump(flow_json, f, indent=2)
+        res = run_cmd(cmd)
+        if res.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed.")
+            return True
 
-            log("FLOW", f"Attempting {action} with schema style '{style}'...")
-
-            # 1. Try direct REST API if bearer access token is available
-            if self.access_token:
-                try:
-                    endpoint_action = f"/{flow_name}" if action == "update" else ""
-                    method = "PUT" if action == "update" else "POST"
-                    rest_url = f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/replicationflows{endpoint_action}?deploy=true"
-                    headers = {
-                        "Authorization": f"Bearer {self.access_token}",
-                        "Content-Type": "application/json",
-                        "Accept": "application/json, application/vnd.sap.datasphere.object.content+json"
-                    }
-                    data_bytes = json.dumps(flow_json).encode("utf-8")
-                    req = urllib.request.Request(rest_url, data=data_bytes, headers=headers, method=method)
-                    with urllib.request.urlopen(req, timeout=45) as resp:
-                        if resp.status in (200, 201, 204):
-                            log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed via direct REST API (schema style: {style}).")
-                            return True
-                except urllib.error.HTTPError as he:
-                    err_body = he.read().decode() if he.fp else str(he)
-                    log("FLOW", f"Direct REST API HTTP {he.code} for style '{style}': {err_body}", "WARN")
-                except Exception as ex:
-                    log("FLOW", f"Direct REST API notice for style '{style}': {ex}", "WARN")
-
-            # 2. Try @sap/datasphere-cli command
-            cmd = [
-                "datasphere", "objects", "replication-flows", action,
+        err = (res.stderr or res.stdout).strip()
+        # 2. If create failed because object already exists (HTTP 409 Conflict), update it!
+        if action == "create" and ("already exists" in err.lower() or "409" in err or "conflict" in err.lower()):
+            log("FLOW", f"Replication Flow '{flow_name}' already exists. Updating and deploying it instead...")
+            update_cmd = [
+                "datasphere", "objects", "replication-flows", "update",
                 "--space", self.source_space,
                 "--technical-name", flow_name,
                 "--file-path", str(flow_file),
                 "--secrets-file", str(self.secrets_path),
-                "--host", self.host,
-                "--verbose"
+                "--host", self.host
             ]
-            res = run_cmd(cmd)
-            if res.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed (schema style: {style}).")
+            ures = run_cmd(update_cmd)
+            if ures.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed.")
                 return True
-            else:
-                err = res.stderr or res.stdout
-                log("FLOW", f"Style '{style}' CLI with --technical-name failed: {err}", "WARN")
+            err = (ures.stderr or ures.stdout).strip()
 
-                # Fallback: CLI without --technical-name (derives name directly from CSN file)
-                cmd_no_name = [
-                    "datasphere", "objects", "replication-flows", action,
-                    "--space", self.source_space,
-                    "--file-path", str(flow_file),
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ]
-                res_no_name = run_cmd(cmd_no_name)
-                if res_no_name.returncode == 0:
-                    log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed (schema style: {style}, derived name).")
-                    return True
-                else:
-                    log("FLOW", f"Style '{style}' CLI without --technical-name failed: {res_no_name.stderr or res_no_name.stdout}", "WARN")
+        # 3. Fallback: try CLI without --technical-name parameter (infers technical name from JSON)
+        fallback_action = "update" if ("already exists" in err.lower() or "409" in err) else action
+        no_name_cmd = [
+            "datasphere", "objects", "replication-flows", fallback_action,
+            "--space", self.source_space,
+            "--file-path", str(flow_file),
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host
+        ]
+        res_no_name = run_cmd(no_name_cmd)
+        if res_no_name.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' successfully processed ({fallback_action}d).")
+            return True
 
-        log("FLOW", f"All schema styles failed to {action} Replication Flow '{flow_name}'.", "ERROR")
+        log("FLOW", f"Failed to deploy Replication Flow '{flow_name}': {err}", "ERROR")
         return False
 
     def execute_flow(self, flow_name: str) -> bool:
@@ -843,16 +696,6 @@ class ReplicationOrchestrator:
 
             self.authenticate_datasphere()
             self.validate_connection()
-            self.template = self.discover_existing_template()
-            if not self.template:
-                template_file = Path("scripts/replication_flow_template.json")
-                if template_file.exists():
-                    try:
-                        with open(template_file, "r", encoding="utf-8") as tf:
-                            self.template = json.load(tf)
-                        log("TEMPLATE", f"Loaded official replication flow template from {template_file}.")
-                    except Exception as te:
-                        log("TEMPLATE", f"Failed to load static template: {te}", "WARN")
 
             for view in views_to_process:
                 flow_name = f"{self.flow_prefix}{view}"
