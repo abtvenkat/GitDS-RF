@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - 'cds_views.txt'
+      - 'scripts/**'
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       force_all:

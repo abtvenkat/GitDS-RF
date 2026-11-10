@@ -298,41 +298,100 @@ class ReplicationOrchestrator:
             return "InitialAndDelta"
         return "InitialOnly"
 
+    def _build_vtypes(self, columns: list) -> dict:
+        """
+        Builds the vTypes.scalar dict required by SAP Datasphere CSN for replication flows.
+        Each unique type referenced via $DYNAMIC.<type> in column vtype-IDs must have an entry.
+        This is REQUIRED by the Datasphere CSN parser - omitting it causes
+        'Failed to create an object from a JSON file or input string'.
+        """
+        vtypes = {}
+        for col in columns:
+            vtype_id = col.get("vtype-ID", "")
+            if not vtype_id.startswith("$DYNAMIC."):
+                continue
+            type_key = vtype_id[len("$DYNAMIC."):]
+            if type_key in vtypes:
+                continue
+            # Parse type from key e.g. string_5, decimal_21_7, int_2
+            if type_key.startswith("string_"):
+                try:
+                    length = int(type_key.split("_", 1)[1])
+                    vtypes[type_key] = {
+                        "name": type_key,
+                        "description": f"String({length})",
+                        "vflow.type": "scalar",
+                        "template": "string",
+                        "value.length": length
+                    }
+                except ValueError:
+                    pass
+            elif type_key.startswith("decimal_"):
+                parts = type_key.split("_")
+                try:
+                    precision = int(parts[1])
+                    scale = int(parts[2])
+                    vtypes[type_key] = {
+                        "name": type_key,
+                        "description": f"Decimal({precision},{scale})",
+                        "vflow.type": "scalar",
+                        "template": "decimal",
+                        "value.precision": precision,
+                        "value.scale": scale
+                    }
+                except (IndexError, ValueError):
+                    pass
+            elif type_key.startswith("int_"):
+                try:
+                    length = int(type_key.split("_", 1)[1])
+                    vtypes[type_key] = {
+                        "name": type_key,
+                        "description": f"Integer({length})",
+                        "vflow.type": "scalar",
+                        "template": "integer",
+                        "value.length": length
+                    }
+                except ValueError:
+                    pass
+        return vtypes
+
     def get_cds_view_schema(self, view_name: str, table_name: str) -> tuple:
         """
         Returns (source_columns, keys, target_columns, entity_elements, target_dict_elems)
         conforming to SAP S/4HANA CDS specifications and Datasphere CSN entity schemas.
+        NOTE: Non-key columns must NOT include "key": False — only key columns carry "key": True,
+        matching the exact SAP Datasphere export format verified against RF_SALES_TEST.
         """
         v = view_name.upper()
         if v == "I_CURRENCY":
             keys = ["Currency"]
             source_cols = [
                 {"name": "Currency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_5", "key": True, "businessName": "Currency", "metadata": {}},
-                {"name": "Decimals", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.int_2", "key": False, "businessName": "Decimals", "metadata": {}},
-                {"name": "CurrencyISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "key": False, "businessName": "ISO Currency Code", "metadata": {}},
-                {"name": "AlternativeCurrencyKey", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "key": False, "businessName": "Alternative Currency Key", "metadata": {}},
-                {"name": "IsPrimaryCurrencyForISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "key": False, "businessName": "Primary Currency", "metadata": {}}
+                {"name": "Decimals", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "businessName": "Decimals", "metadata": {}},
+                {"name": "CurrencyISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "businessName": "ISO Currency Code", "metadata": {}},
+                {"name": "AlternativeCurrencyKey", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "businessName": "Alternative Currency Key", "metadata": {}},
+                {"name": "IsPrimaryCurrencyForISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Primary Currency", "metadata": {}}
             ]
             entity_elems = {
                 "Currency": {"type": "cds.String", "length": 5, "key": True, "notNull": True, "@EndUserText.label": "Currency"},
-                "Decimals": {"type": "cds.Integer", "key": False, "@EndUserText.label": "Decimals"},
-                "CurrencyISOCode": {"type": "cds.String", "length": 3, "key": False, "@EndUserText.label": "ISO Currency Code"},
-                "AlternativeCurrencyKey": {"type": "cds.String", "length": 3, "key": False, "@EndUserText.label": "Alternative Currency Key"},
-                "IsPrimaryCurrencyForISOCode": {"type": "cds.String", "length": 1, "key": False, "@EndUserText.label": "Primary Currency"}
+                "Decimals": {"type": "cds.String", "length": 2, "@EndUserText.label": "Decimals"},
+                "CurrencyISOCode": {"type": "cds.String", "length": 3, "@EndUserText.label": "ISO Currency Code"},
+                "AlternativeCurrencyKey": {"type": "cds.String", "length": 3, "@EndUserText.label": "Alternative Currency Key"},
+                "IsPrimaryCurrencyForISOCode": {"type": "cds.String", "length": 1, "@EndUserText.label": "Primary Currency"}
             }
         elif v == "I_CURRENCYTEXT":
             keys = ["Language", "Currency"]
             source_cols = [
                 {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key", "metadata": {}},
                 {"name": "Currency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_5", "key": True, "businessName": "Currency", "metadata": {}},
-                {"name": "CurrencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "key": False, "businessName": "Currency Name", "metadata": {}},
-                {"name": "CurrencyShortName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_15", "key": False, "businessName": "Short text", "metadata": {}}
+                {"name": "CurrencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Currency Name", "metadata": {}},
+                {"name": "CurrencyShortName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_15", "businessName": "Short text", "metadata": {}}
             ]
             entity_elems = {
                 "Language": {"type": "cds.String", "length": 2, "key": True, "notNull": True, "@EndUserText.label": "Language Key"},
                 "Currency": {"type": "cds.String", "length": 5, "key": True, "notNull": True, "@EndUserText.label": "Currency"},
-                "CurrencyName": {"type": "cds.String", "length": 40, "key": False, "@EndUserText.label": "Currency Name"},
-                "CurrencyShortName": {"type": "cds.String", "length": 15, "key": False, "@EndUserText.label": "Short text"}
+                "CurrencyName": {"type": "cds.String", "length": 40, "@EndUserText.label": "Currency Name"},
+                "CurrencyShortName": {"type": "cds.String", "length": 15, "@EndUserText.label": "Short text"}
             }
         else:
             # Fallback for dynamic/arbitrary CDS view: provide basic string key + field
@@ -344,26 +403,53 @@ class ReplicationOrchestrator:
                 f"{view_name}_KEY": {"type": "cds.String", "length": 50, "key": True, "notNull": True, "@EndUserText.label": f"{view_name} Key"}
             }
 
+        # Target columns mirror source columns exactly (same list)
         target_cols = [dict(c) for c in source_cols]
+        # Target dict elems: each column name maps to empty dict (SAP Datasphere format)
         target_dict_elems = {col["name"]: {} for col in source_cols}
         return source_cols, keys, target_cols, entity_elems, target_dict_elems
 
     def build_flow_definition(self, flow_name: str, view_name: str, table_name: str) -> dict:
         """
         Builds the SAP Datasphere Replication Flow JSON definition.
-        Strictly conforms to official SAP Datasphere CSN specification:
-        - $version: "1.0"
-        - version: {"csn": "1.0"}
-        - replicationflows: { <flow_name>: { kind: "sap.dis.replicationflow", contents: { ... } } }
-        - definitions: { <table_name>: { kind: "entity", ... } }
-        - Configures Skip Unmapped Columns, Native Type, and Auto-merge settings.
+        Strictly conforms to the official SAP Datasphere CSN export format verified against
+        a working exported Replication Flow (RF_SALES_TEST).
+
+        Key structural requirements:
+        - definitions: { <table_name>: entity def }  FIRST
+        - version, meta
+        - replicationflows: { <flow_name>: { kind, contents: {
+              sourceSystem, targetSystem,
+              vTypes: { scalar: { ... } },   <- REQUIRED - type registry for $DYNAMIC.X refs
+              replicationTasks: [...],
+              replicationTaskSetting, replicationFlowSetting, deltaLoadTrigger
+            },
+            sources: {},
+            targets: { <table>: { elements: { <col>: {} } } },
+            connections: { <conn>: {} }
+          }
+        }
+        - $version: "1.0"  LAST (as per SAP export format)
+
+        Always uses loadType INITIAL (Initial Only).
+        Always enables: Skip Unmapped Columns, Native Type content, Auto-merge.
         """
-        load_type_val = "INITIAL" if "INITIAL" in self.load_type else "INITIAL_AND_DELTA"
-        target_conn_id = "DWC_HDLF" if self.target_conn in ("DATASPHERE_LOCAL", "DWC_HDLF", "") else self.target_conn
+        # Load type is always INITIAL for initial-only replication
+        load_type_val = "INITIAL"
+
+        # Target connection resolution
+        target_conn_id = self.target_conn if self.target_conn else "DWC_HDLF"
+        if target_conn_id in ("DATASPHERE_LOCAL", ""):
+            target_conn_id = "DWC_HDLF"
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
+
         source_container = f"/{self.source_container.lstrip('/')}"
 
         source_cols, keys, target_cols, entity_elems, target_dict_elems = self.get_cds_view_schema(view_name, table_name)
+
+        # Build vTypes registry from all columns - REQUIRED by Datasphere CSN parser
+        all_cols = source_cols + [c for c in target_cols if c["name"] not in {s["name"] for s in source_cols}]
+        vtypes_scalar = self._build_vtypes(all_cols)
 
         flow_body = {
             "kind": "sap.dis.replicationflow",
@@ -403,6 +489,10 @@ class ReplicationOrchestrator:
                         }
                     }
                 ],
+                # vTypes is REQUIRED: provides type definitions for $DYNAMIC.X vtype-IDs
+                "vTypes": {
+                    "scalar": vtypes_scalar
+                },
                 "replicationTasks": [
                     {
                         "name": "replicationtask1",
@@ -411,21 +501,27 @@ class ReplicationOrchestrator:
                         "truncate": False,
                         "sourceObject": {
                             "name": view_name,
-                            "businessName": view_name,
                             "definition": {
                                 "columns": source_cols,
                                 "keys": keys
                             },
                             "metadata": {
-                                "type": "tabular"
-                            }
+                                "type": "tabular",
+                                # isDeltaDisabled=True ensures INITIAL-only mode is enforced
+                                "isDeltaDisabled": True
+                            },
+                            "businessName": view_name
                         },
                         "targetObject": {
                             "name": table_name,
-                            "businessName": table_name,
                             "definition": {
-                                "columns": target_cols
-                            }
+                                "columns": target_cols,
+                                "keys": keys
+                            },
+                            "metadata": {
+                                "isNew": True
+                            },
+                            "businessName": table_name
                         }
                     }
                 ],
@@ -469,18 +565,20 @@ class ReplicationOrchestrator:
             }
         }
 
+        # IMPORTANT: key order matches SAP Datasphere export format exactly:
+        # definitions -> version -> meta -> replicationflows -> $version (at end)
         return {
-            "$version": "1.0",
+            "definitions": definitions,
             "version": {
                 "csn": "1.0"
             },
             "meta": {
                 "creator": "CDS Compiler v1.19.2"
             },
-            "definitions": definitions,
             "replicationflows": {
                 flow_name: flow_body
-            }
+            },
+            "$version": "1.0"
         }
 
     def check_flow_exists(self, flow_name: str) -> bool:
@@ -494,6 +592,23 @@ class ReplicationOrchestrator:
         res = run_cmd(cmd)
         return res.returncode == 0
 
+    def delete_flow_if_exists(self, flow_name: str):
+        """Attempt to delete an existing (draft) flow to allow clean creation."""
+        log("FLOW", f"Attempting to delete existing draft flow '{flow_name}' for clean recreation...")
+        cmd = [
+            "datasphere", "objects", "replication-flows", "delete",
+            "--space", self.source_space,
+            "--technical-name", flow_name,
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host,
+            "--no-interaction"
+        ]
+        res = run_cmd(cmd)
+        if res.returncode == 0:
+            log("FLOW", f"Deleted existing flow '{flow_name}' successfully.")
+        else:
+            log("FLOW", f"Could not delete flow '{flow_name}' (may be deployed/running): {res.stderr or res.stdout}", "WARN")
+
     def create_or_update_flow(self, flow_name: str, view_name: str, table_name: str) -> bool:
         exists = self.check_flow_exists(flow_name)
         action = "update" if exists else "create"
@@ -503,6 +618,9 @@ class ReplicationOrchestrator:
         flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
         with open(flow_file, "w", encoding="utf-8") as f:
             json.dump(flow_json, f, indent=2)
+
+        # Log the JSON structure (truncated) for debugging
+        log("FLOW", f"Flow JSON top-level keys: {list(flow_json.keys())}")
 
         # 1. Execute primary action (create or update) via CLI
         cmd = [
@@ -519,6 +637,7 @@ class ReplicationOrchestrator:
             return True
 
         err = (res.stderr or res.stdout).strip()
+        log("FLOW", f"Primary {action} attempt failed: {err}", "WARN")
 
         # 2. If initial attempt failed, try with --deploy-anyway
         deploy_anyway_cmd = cmd + ["--deploy-anyway"]
@@ -550,7 +669,23 @@ class ReplicationOrchestrator:
                 return True
             err = (ures.stderr or ures.stdout).strip()
 
-        # 3. Fallback: try CLI without --technical-name parameter (infers technical name from JSON)
+        # 4. Fallback: try deleting existing draft flow and recreating cleanly
+        log("FLOW", f"Deployment did not succeed directly. Attempting clean recreate of '{flow_name}'...")
+        self.delete_flow_if_exists(flow_name)
+        create_clean_cmd = [
+            "datasphere", "objects", "replication-flows", "create",
+            "--space", self.source_space,
+            "--technical-name", flow_name,
+            "--file-path", str(flow_file),
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host
+        ]
+        clean_res = run_cmd(create_clean_cmd)
+        if clean_res.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' successfully created and deployed after clean reset.")
+            return True
+
+        # 5. Fallback: try CLI without --technical-name parameter (infers technical name from JSON)
         fallback_action = "update" if ("already exists" in err.lower() or "409" in err) else action
         no_name_cmd = [
             "datasphere", "objects", "replication-flows", fallback_action,
