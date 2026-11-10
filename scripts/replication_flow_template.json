@@ -1,0 +1,84 @@
+{
+  "definitions": {},
+  "version": {
+    "csn": "1.0"
+  },
+  "meta": {
+    "creator": "CDS Compiler v1.19.2"
+  },
+  "replicationflows": {
+    "TEMPLATE_FLOW": {
+      "kind": "sap.dis.replicationflow",
+      "@EndUserText.label": "TEMPLATE_FLOW",
+      "contents": {
+        "description": "TEMPLATE_FLOW",
+        "sourceSystem": [
+          {
+            "connectionId": "S3XReplicationflows",
+            "connectionType": "SAPS4HANAOP",
+            "container": "/CDS_EXTRACTION",
+            "maxConnections": 10,
+            "isGeneric": false,
+            "metadata": {}
+          }
+        ],
+        "targetSystem": [
+          {
+            "connectionId": "DWC_HDLF",
+            "connectionType": "HDL_FILES",
+            "container": "",
+            "maxConnections": 10,
+            "isGeneric": false,
+            "metadata": {
+              "connectionMetaschema": {
+                "sources": [
+                  "SAP"
+                ]
+              }
+            },
+            "properties": {
+              "compression": "SNAPPY",
+              "format": "PARQUET",
+              "groupDeltaFilesBy": "NONE",
+              "com.sap.rms.write.forceDecfloatsToTargetValueRange": "false",
+              "objectstore.write.useDuplicateSuppressionInitialLoad": "false",
+              "objectstore.write.parquet.compatibilityMode": "SPARK",
+              "objectstore.write.createLargePartFiles": "false"
+            }
+          }
+        ],
+        "replicationTasks": [
+          {
+            "name": "replicationtask1",
+            "loadType": "INITIAL",
+            "priority": 50,
+            "truncate": false,
+            "sourceObject": {
+              "name": "I_SALESORGANIZATION",
+              "businessName": "Sales organization"
+            },
+            "targetObject": {
+              "name": "I_SALESORGANIZATION_Delta",
+              "businessName": "Sales organization"
+            }
+          }
+        ],
+        "replicationTaskSetting": {
+          "hasSkipMappingCapability": true
+        },
+        "replicationFlowSetting": {
+          "ABAPcontentTypeDisabled": false,
+          "ABAPcontentType": "Native Type",
+          "isAutoMergeEnabledForTarget": true
+        },
+        "deltaLoadTrigger": "ON_DELTA_INTERVAL"
+      },
+      "sources": {},
+      "targets": {},
+      "connections": {
+        "S3XReplicationflows": {}
+      }
+    }
+  },
+  "$version": "1.0"
+}

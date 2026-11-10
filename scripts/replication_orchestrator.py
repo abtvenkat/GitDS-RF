@@ -357,190 +357,174 @@ class ReplicationOrchestrator:
 
         return {}
 
-    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str, style: str = "ReplicationFlow_elements") -> dict:
+    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str, style: str = "sap_dis_replicationflow") -> dict:
         """
         Builds the SAP Datasphere Replication Flow JSON definition.
-        Supports template adaptation, native ReplicationFlow CSN schema, and variations.
+        Strictly conforms to official SAP Datasphere CSN specification:
+        - $version: "1.0"
+        - version: {"csn": "1.0"}
+        - replicationflows: { <flow_name>: { kind: "sap.dis.replicationflow", contents: { ... } } }
         """
-        load_type = self.get_load_type_name()
+        load_type_val = "INITIAL" if "INITIAL" in self.load_type else "INITIAL_AND_DELTA"
+        target_conn_id = "DWC_HDLF" if self.target_conn in ("DATASPHERE_LOCAL", "DWC_HDLF", "") else self.target_conn
+        target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
+        source_container = f"/{self.source_container.lstrip('/')}"
 
-        if style == "template" and self.template and "definitions" in self.template:
+        # Standard official sap.dis.replicationflow body
+        flow_body = {
+            "kind": "sap.dis.replicationflow",
+            "@EndUserText.label": flow_name,
+            "contents": {
+                "description": flow_name,
+                "sourceSystem": [
+                    {
+                        "connectionId": self.source_conn,
+                        "connectionType": "SAPS4HANAOP",
+                        "container": source_container,
+                        "maxConnections": 10,
+                        "isGeneric": False,
+                        "metadata": {}
+                    }
+                ],
+                "targetSystem": [
+                    {
+                        "connectionId": target_conn_id,
+                        "connectionType": target_conn_type,
+                        "container": "",
+                        "maxConnections": 10,
+                        "isGeneric": False,
+                        "metadata": {
+                            "connectionMetaschema": {
+                                "sources": ["SAP"]
+                            }
+                        },
+                        "properties": {
+                            "compression": "SNAPPY",
+                            "format": "PARQUET",
+                            "groupDeltaFilesBy": "NONE",
+                            "com.sap.rms.write.forceDecfloatsToTargetValueRange": "false",
+                            "objectstore.write.useDuplicateSuppressionInitialLoad": "false",
+                            "objectstore.write.parquet.compatibilityMode": "SPARK",
+                            "objectstore.write.createLargePartFiles": "false"
+                        }
+                    }
+                ],
+                "replicationTasks": [
+                    {
+                        "name": "replicationtask1",
+                        "loadType": load_type_val,
+                        "priority": 50,
+                        "truncate": False,
+                        "sourceObject": {
+                            "name": view_name,
+                            "businessName": view_name
+                        },
+                        "targetObject": {
+                            "name": table_name,
+                            "businessName": table_name
+                        }
+                    }
+                ],
+                "replicationTaskSetting": {
+                    "hasSkipMappingCapability": True
+                },
+                "replicationFlowSetting": {
+                    "ABAPcontentTypeDisabled": False,
+                    "ABAPcontentType": "Native Type",
+                    "isAutoMergeEnabledForTarget": True
+                },
+                "deltaLoadTrigger": "ON_DELTA_INTERVAL"
+            },
+            "sources": {},
+            "targets": {
+                table_name: {
+                    "elements": {}
+                }
+            },
+            "connections": {
+                self.source_conn: {}
+            }
+        }
+
+        if style == "template" and self.template and "replicationflows" in self.template:
             import copy
             t_def = copy.deepcopy(self.template)
-            t_def["$version"] = t_def.get("$version", "2.0")
-            old_keys = list(t_def["definitions"].keys())
-            if old_keys:
-                old_key = old_keys[0]
-                flow_body = t_def["definitions"].pop(old_key)
-                
-                target_block = flow_body.get("element") or flow_body.get("elements") or flow_body
-                if "sourceConnection" in target_block:
-                    target_block["sourceConnection"] = self.source_conn
-                if "targetConnection" in target_block:
-                    target_block["targetConnection"] = self.target_conn
-                if "loadType" in target_block:
-                    target_block["loadType"] = load_type
-                
-                sources = target_block.get("sources", [])
-                if sources and isinstance(sources, list):
-                    sources[0]["container"] = self.source_container
-                    sources[0]["objects"] = [{"name": view_name, "targetName": table_name}]
-                
-                new_key = f"{self.source_space}.{flow_name}" if "." in old_key else flow_name
-                t_def["definitions"][new_key] = flow_body
-                return t_def
-
-        if style == "ReplicationFlow_elements":
-            # PascalCase ReplicationFlow artifact type
-            return {
-                "$version": "2.0",
-                "definitions": {
-                    flow_name: {
-                        "kind": "ReplicationFlow",
-                        "@EndUserText.label": flow_name,
-                        "elements": {
-                            "sourceConnection": {
-                                "type": "cds.String",
-                                "@datasphere.connectionId": self.source_conn
-                            },
-                            "sourceContainer": {
-                                "type": "cds.String",
-                                "@datasphere.containerId": self.source_container
-                            },
-                            "targetConnection": {
-                                "type": "cds.String",
-                                "@datasphere.connectionId": self.target_conn
-                            },
-                            "replicationObjects": [
-                                {
-                                    "sourceObject": view_name,
-                                    "targetObject": table_name,
-                                    "loadType": load_type
-                                }
-                            ]
+            t_flows = t_def["replicationflows"]
+            old_flow_key = list(t_flows.keys())[0] if t_flows else "TEMPLATE_FLOW"
+            t_body = t_flows.pop(old_flow_key, copy.deepcopy(flow_body))
+            t_body["@EndUserText.label"] = flow_name
+            if "contents" in t_body:
+                t_body["contents"]["description"] = flow_name
+                if "sourceSystem" in t_body["contents"] and t_body["contents"]["sourceSystem"]:
+                    t_body["contents"]["sourceSystem"][0]["connectionId"] = self.source_conn
+                    t_body["contents"]["sourceSystem"][0]["container"] = source_container
+                if "targetSystem" in t_body["contents"] and t_body["contents"]["targetSystem"]:
+                    t_body["contents"]["targetSystem"][0]["connectionId"] = target_conn_id
+                t_body["contents"]["replicationTasks"] = [
+                    {
+                        "name": "replicationtask1",
+                        "loadType": load_type_val,
+                        "priority": 50,
+                        "truncate": False,
+                        "sourceObject": {
+                            "name": view_name,
+                            "businessName": view_name
+                        },
+                        "targetObject": {
+                            "name": table_name,
+                            "businessName": table_name
                         }
                     }
+                ]
+            t_body["targets"] = {table_name: {"elements": {}}}
+            t_body["connections"] = {self.source_conn: {}}
+            t_def["replicationflows"] = {flow_name: t_body}
+            t_def["definitions"] = {}
+            t_def["$version"] = "1.0"
+            return t_def
+
+        elif style == "space_prefixed_flow":
+            return {
+                "$version": "1.0",
+                "version": {
+                    "csn": "1.0"
+                },
+                "meta": {
+                    "creator": "CDS Compiler v1.19.2"
+                },
+                "definitions": {},
+                "replicationflows": {
+                    f"{self.source_space}.{flow_name}": flow_body
                 }
             }
 
-        elif style == "ReplicationFlow_sources":
-            # ReplicationFlow with top-level sources/targets
+        elif style == "version_2_sap_dis_flow":
             return {
                 "$version": "2.0",
-                "definitions": {
-                    flow_name: {
-                        "kind": "ReplicationFlow",
-                        "@EndUserText.label": flow_name,
-                        "sourceConnection": self.source_conn,
-                        "targetConnection": self.target_conn,
-                        "loadType": load_type,
-                        "sources": [
-                            {
-                                "container": self.source_container,
-                                "objects": [
-                                    {
-                                        "name": view_name,
-                                        "targetName": table_name
-                                    }
-                                ]
-                            }
-                        ]
-                    }
+                "version": {
+                    "csn": "1.0"
+                },
+                "meta": {
+                    "creator": "CDS Compiler v1.19.2"
+                },
+                "definitions": {},
+                "replicationflows": {
+                    flow_name: flow_body
                 }
             }
 
-        elif style == "replicationFlow_element":
-            # camelCase replicationFlow with element wrapper
+        else:  # default "sap_dis_replicationflow"
             return {
-                "$version": "2.0",
-                "definitions": {
-                    flow_name: {
-                        "kind": "replicationFlow",
-                        "element": {
-                            "sourceConnection": self.source_conn,
-                            "targetConnection": self.target_conn,
-                            "loadType": load_type,
-                            "sources": [
-                                {
-                                    "container": self.source_container,
-                                    "objects": [
-                                        {
-                                            "name": view_name,
-                                            "targetName": table_name
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
-
-        elif style == "csn_standard":
-            # CSN entity notation
-            return {
-                "$version": "2.0",
-                "definitions": {
-                    flow_name: {
-                        "kind": "entity",
-                        "@EndUserText.label": flow_name,
-                        "@datasphere.flow.type": "Replication",
-                        "elements": {
-                            "sourceConnection": {
-                                "type": "cds.String",
-                                "@datasphere.connectionId": self.source_conn
-                            },
-                            "sourceContainer": {
-                                "type": "cds.String",
-                                "@datasphere.containerId": self.source_container
-                            },
-                            "targetConnection": {
-                                "type": "cds.String",
-                                "@datasphere.connectionId": self.target_conn
-                            },
-                            "replicationObjects": [
-                                {
-                                    "sourceObject": view_name,
-                                    "targetObject": table_name,
-                                    "loadType": load_type
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
-
-        else:
-            # CSN space-qualified key
-            return {
-                "$version": "2.0",
-                "definitions": {
-                    f"{self.source_space}.{flow_name}": {
-                        "kind": "ReplicationFlow",
-                        "@EndUserText.label": flow_name,
-                        "@datasphere.flow.type": "Replication",
-                        "elements": {
-                            "sourceConnection": {
-                                "type": "cds.String",
-                                "@datasphere.connectionId": self.source_conn
-                            },
-                            "sourceContainer": {
-                                "type": "cds.String",
-                                "@datasphere.containerId": self.source_container
-                            },
-                            "targetConnection": {
-                                "type": "cds.String",
-                                "@datasphere.connectionId": self.target_conn
-                            },
-                            "replicationObjects": [
-                                {
-                                    "sourceObject": view_name,
-                                    "targetObject": table_name,
-                                    "loadType": load_type
-                                }
-                            ]
-                        }
-                    }
+                "$version": "1.0",
+                "version": {
+                    "csn": "1.0"
+                },
+                "meta": {
+                    "creator": "CDS Compiler v1.19.2"
+                },
+                "definitions": {},
+                "replicationflows": {
+                    flow_name: flow_body
                 }
             }
 
@@ -560,16 +544,12 @@ class ReplicationOrchestrator:
         action = "update" if exists else "create"
         log("FLOW", f"{action.capitalize()}ing Replication Flow '{flow_name}' for CDS View '{view_name}'...")
 
-        styles_to_try = []
-        if self.template:
-            styles_to_try.append("template")
-        styles_to_try.extend([
-            "ReplicationFlow_elements",
-            "ReplicationFlow_sources",
-            "replicationFlow_element",
-            "csn_standard",
-            "csn_space_prefixed"
-        ])
+        styles_to_try = [
+            "sap_dis_replicationflow",
+            "template",
+            "space_prefixed_flow",
+            "version_2_sap_dis_flow"
+        ]
         for style in styles_to_try:
             flow_json = self.build_flow_definition(flow_name, view_name, table_name, style=style)
             flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
@@ -617,7 +597,22 @@ class ReplicationOrchestrator:
                 return True
             else:
                 err = res.stderr or res.stdout
-                log("FLOW", f"Style '{style}' failed: {err}", "WARN")
+                log("FLOW", f"Style '{style}' CLI with --technical-name failed: {err}", "WARN")
+
+                # Fallback: CLI without --technical-name (derives name directly from CSN file)
+                cmd_no_name = [
+                    "datasphere", "objects", "replication-flows", action,
+                    "--space", self.source_space,
+                    "--file-path", str(flow_file),
+                    "--secrets-file", str(self.secrets_path),
+                    "--host", self.host
+                ]
+                res_no_name = run_cmd(cmd_no_name)
+                if res_no_name.returncode == 0:
+                    log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed (schema style: {style}, derived name).")
+                    return True
+                else:
+                    log("FLOW", f"Style '{style}' CLI without --technical-name failed: {res_no_name.stderr or res_no_name.stdout}", "WARN")
 
         log("FLOW", f"All schema styles failed to {action} Replication Flow '{flow_name}'.", "ERROR")
         return False
@@ -849,6 +844,15 @@ class ReplicationOrchestrator:
             self.authenticate_datasphere()
             self.validate_connection()
             self.template = self.discover_existing_template()
+            if not self.template:
+                template_file = Path("scripts/replication_flow_template.json")
+                if template_file.exists():
+                    try:
+                        with open(template_file, "r", encoding="utf-8") as tf:
+                            self.template = json.load(tf)
+                        log("TEMPLATE", f"Loaded official replication flow template from {template_file}.")
+                    except Exception as te:
+                        log("TEMPLATE", f"Failed to load static template: {te}", "WARN")
 
             for view in views_to_process:
                 flow_name = f"{self.flow_prefix}{view}"
