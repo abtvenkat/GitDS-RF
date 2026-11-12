@@ -357,10 +357,9 @@ class ReplicationOrchestrator:
 
     def get_cds_view_schema(self, view_name: str, table_name: str) -> tuple:
         """
-        Returns (source_cols, keys, target_cols, target_dict_elems)
-        Strictly conforms to SAP Datasphere Replication Flow schema targeting DWC_HDLF (Delta Lake).
-        Target columns MUST include Change_Type ($DYNAMIC.string_1) and Change_Date (com.sap.core.timestamp)
-        which are required by Datasphere's Delta Lake / HDL_FILES engine.
+        Returns (source_cols, keys, target_cols, target_dict_elems, business_elements, delta_elements)
+        Strictly conforms to official SAP Datasphere Replication Flow CSN specification
+        verified against live tenant exports (RF_SALES_TEST targeting DWC_HDLF / Delta Lake).
         """
         v = view_name.upper()
         if v == "I_CURRENCY":
@@ -387,7 +386,7 @@ class ReplicationOrchestrator:
                 {"name": f"{view_name}_KEY", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50", "key": True, "businessName": f"{view_name} Key", "metadata": {}}
             ]
 
-        # Target columns: business columns + Change_Type + Change_Date (required for Delta Lake / DWC_HDLF)
+        # Target columns: business columns + Change_Type ($DYNAMIC.string_1) + Change_Date (com.sap.core.timestamp)
         target_cols = [dict(c) for c in source_cols] + [
             {"name": "Change_Type", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "metadata": {}},
             {"name": "Change_Date", "vflow.type": "scalar", "vtype-ID": "com.sap.core.timestamp", "metadata": {}}
@@ -396,29 +395,27 @@ class ReplicationOrchestrator:
         # Target dict elements for flow 'targets' map
         target_dict_elems = {col["name"]: {} for col in target_cols}
 
-        # Build CSN entity elements for Local Table definition
-        entity_elements = {}
-        for col in target_cols:
+        # 1. Business elements for active Local Table entity
+        business_elements = {}
+        for col in source_cols:
             cname = col["name"]
             vtype = col.get("vtype-ID", "")
             is_key = col.get("key", False)
-            if cname == "Change_Type":
-                entity_elements[cname] = {"type": "cds.String", "length": 1, "key": False}
-            elif cname == "Change_Date":
-                entity_elements[cname] = {"type": "cds.Timestamp", "key": False}
-            elif "string" in vtype:
+            blabel = col.get("businessName", cname)
+            if "string" in vtype:
                 try:
                     l = int(vtype.split("_")[1])
                 except Exception:
                     l = 50
-                entity_elements[cname] = {
+                elem = {
+                    "@EndUserText.label": blabel,
                     "type": "cds.String",
-                    "length": l,
                     "key": is_key,
-                    "@EndUserText.label": col.get("businessName", cname)
+                    "length": l
                 }
                 if is_key:
-                    entity_elements[cname]["notNull"] = True
+                    elem["notNull"] = True
+                business_elements[cname] = elem
             elif "decimal" in vtype:
                 parts = vtype.split("_")
                 try:
@@ -426,124 +423,79 @@ class ReplicationOrchestrator:
                     s = int(parts[2])
                 except Exception:
                     p, s = 21, 7
-                entity_elements[cname] = {
+                elem = {
+                    "@EndUserText.label": blabel,
                     "type": "cds.Decimal",
+                    "key": is_key,
                     "precision": p,
-                    "scale": s,
-                    "key": is_key,
-                    "@EndUserText.label": col.get("businessName", cname)
+                    "scale": s
                 }
+                if is_key:
+                    elem["notNull"] = True
+                business_elements[cname] = elem
             elif "int" in vtype:
-                entity_elements[cname] = {
+                elem = {
+                    "@EndUserText.label": blabel,
                     "type": "cds.Integer",
-                    "key": is_key,
-                    "@EndUserText.label": col.get("businessName", cname)
+                    "key": is_key
                 }
+                if is_key:
+                    elem["notNull"] = True
+                business_elements[cname] = elem
             else:
-                entity_elements[cname] = {
+                elem = {
+                    "@EndUserText.label": blabel,
                     "type": "cds.String",
-                    "length": 50,
                     "key": is_key,
-                    "@EndUserText.label": col.get("businessName", cname)
+                    "length": 50
                 }
+                if is_key:
+                    elem["notNull"] = True
+                business_elements[cname] = elem
 
-        return source_cols, keys, target_cols, target_dict_elems, entity_elements
-
-    def create_or_update_local_table(self, table_name: str, view_name: str) -> bool:
-        """
-        Pre-creates and deploys the target Local Table directly in the space.
-        This ensures the target table exists as an active, saved object in SAP Datasphere,
-        permanently resolving the 'There are unsaved target objects. Please save again' issue.
-        """
-        log("TABLE", f"Ensuring Local Table '{table_name}' is created and deployed in space '{self.source_space}'...")
-
-        source_cols, keys, target_cols, target_dict_elems, entity_elements = self.get_cds_view_schema(view_name, table_name)
-
-        table_csn = {
-            "definitions": {
-                table_name: {
-                    "kind": "entity",
-                    "@EndUserText.label": view_name,
-                    "@ObjectModel.modelingPattern": {
-                        "#": "DATA_STRUCTURE"
-                    },
-                    "@ObjectModel.supportedCapabilities": [
-                        {
-                            "#": "DATA_STRUCTURE"
-                        }
-                    ],
-                    "@DataWarehouse.delta": {
-                        "type": {
-                            "#": "UPSERT"
-                        },
-                        "dateTimeElement": {
-                            "=": "Change_Date"
-                        },
-                        "modeElement": {
-                            "=": "Change_Type"
-                        }
-                    },
-                    "@DataWarehouse.persistence.hdlf.tableFormat": {
-                        "#": "DELTA_LAKE"
-                    },
-                    "@cds.persistence.udf": True,
-                    "elements": entity_elements
-                }
+        # 2. Delta elements for Delta Capture entity (business elements + Change_Type + Change_Date)
+        delta_elements = dict(business_elements)
+        delta_elements["Change_Type"] = {
+            "@EndUserText.label": "Change_Type",
+            "type": "cds.String",
+            "key": False,
+            "notNull": True,
+            "length": 1,
+            "default": {
+                "val": "I"
+            }
+        }
+        delta_elements["Change_Date"] = {
+            "@EndUserText.label": "Change_Date",
+            "type": "cds.Timestamp",
+            "key": False,
+            "notNull": True,
+            "default": {
+                "func": "CURRENT_UTCTIMESTAMP"
             }
         }
 
-        table_file = Path(self.temp_dir.name) / f"{table_name}_entity.json"
-        with open(table_file, "w", encoding="utf-8") as f:
-            json.dump(table_csn, f, indent=2)
-
-        # 1. Try create
-        create_cmd = [
-            "datasphere", "objects", "local-tables", "create",
-            "--space", self.source_space,
-            "--technical-name", table_name,
-            "--file-path", str(table_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        res = run_cmd(create_cmd)
-        if res.returncode == 0:
-            log("TABLE", f"Local Table '{table_name}' successfully created and deployed in space '{self.source_space}'.")
-            return True
-
-        err = (res.stderr or res.stdout).strip()
-        # 2. If already exists (409 conflict), update to ensure schema and deployment are up to date
-        if "already exists" in err.lower() or "409" in err or "conflict" in err.lower():
-            log("TABLE", f"Local Table '{table_name}' already exists in space '{self.source_space}'. Ensuring deployed state via update...")
-            update_cmd = [
-                "datasphere", "objects", "local-tables", "update",
-                "--space", self.source_space,
-                "--technical-name", table_name,
-                "--file-path", str(table_file),
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host
-            ]
-            ures = run_cmd(update_cmd)
-            if ures.returncode == 0:
-                log("TABLE", f"Local Table '{table_name}' successfully updated and deployed in space '{self.source_space}'.")
-                return True
-
-        log("TABLE", f"Pre-creation notice for Local Table '{table_name}': {err}. Proceeding with replication flow deployment.", "WARN")
-        return False
+        return source_cols, keys, target_cols, target_dict_elems, business_elements, delta_elements
 
     def build_flow_definition(self, flow_name: str, view_name: str, table_name: str) -> tuple:
         """
-        Builds the SAP Datasphere Replication Flow definition.
-        Returns:
-            (wrapped_flow_json, full_csn_json, bare_flow_json)
+        Builds the complete SAP Datasphere Replication Flow CSN definition bundling both
+        the target entities under `definitions` and the flow under `replicationflows`.
         
-        Strictly conforms to official SAP Datasphere Replication Flow JSON specifications
-        verified against live flows (DATAVALIDATION and RF_SALES_TEST in RAD_S3X):
-        - loadType: INITIAL (strictly Initial Only)
-        - isDeltaDisabled: True
-        - Skip Unmapped Columns: hasSkipMappingCapability = True
-        - Content Type: ABAPcontentType = "Native Type", ABAPcontentTypeDisabled = False
-        - Auto-merge: isAutoMergeEnabledForTarget = True
-        - Target properties: com.sap.datasuite.tableCategory = DELTA, cdc mode & timestamp columns
+        Strictly conforms to official SAP Datasphere Replication Flow CSN specification
+        verified against live tenant export (RF_SALES_TEST targeting DWC_HDLF / Delta Lake):
+        - definitions contains:
+            1. {table_name}_Delta: Delta capture entity with @DataWarehouse.enclosingObject = table_name,
+               @DataWarehouse.persistence.hdlf.tableFormat = DELTA_LAKE, interval params, Change_Type & Change_Date.
+            2. {table_name}: Active Local Table entity with @DataWarehouse.delta.deltaFromEntities = [{table_name}_Delta],
+               @DataWarehouse.persistence.hdlf.tableFormat = DELTA_LAKE, and business columns.
+        - replicationflows contains:
+            1. loadType: INITIAL (strictly Initial Only)
+            2. targetObject: name = {table_name}_Delta, metadata.isNew = false,
+               properties with CDC mode and timestamp columns and DELTA category.
+            3. replicationTaskSetting: hasSkipMappingCapability = true
+            4. replicationFlowSetting: Native Type, isAutoMergeEnabledForTarget = true
+            5. deltaLoadTrigger: ON_DELTA_INTERVAL
         """
         load_type_val = "INITIAL"
 
@@ -554,12 +506,114 @@ class ReplicationOrchestrator:
 
         source_container = f"/{self.source_container.lstrip('/')}"
 
-        source_cols, keys, target_cols, target_dict_elems, entity_elements = self.get_cds_view_schema(view_name, table_name)
+        source_cols, keys, target_cols, target_dict_elems, business_elements, delta_elements = self.get_cds_view_schema(view_name, table_name)
 
         # Build vTypes registry from all columns with $DYNAMIC types
         all_cols = source_cols + target_cols
         vtypes_scalar = self._build_vtypes(all_cols)
 
+        delta_table_name = f"{table_name}_Delta"
+
+        # 1. Delta Capture Entity Definition
+        delta_entity = {
+            "kind": "entity",
+            "@EndUserText.label": view_name,
+            "@ObjectModel.modelingPattern": {
+                "#": "DATA_STRUCTURE"
+            },
+            "@ObjectModel.supportedCapabilities": [
+                {
+                    "#": "DATA_STRUCTURE"
+                }
+            ],
+            "@DataWarehouse.delta": {
+                "type": {
+                    "#": "UPSERT"
+                },
+                "dateTimeElement": {
+                    "=": "Change_Date"
+                },
+                "modeElement": {
+                    "=": "Change_Type"
+                }
+            },
+            "@DataWarehouse.enclosingObject": table_name,
+            "params": {
+                "EXTRACTION_MODE": {
+                    "@EndUserText.label": "Extraction Mode",
+                    "type": "cds.String",
+                    "length": 10,
+                    "default": "FULL",
+                    "@DataWarehouse.bw.extractionMode": True
+                },
+                "FROM_VERSION": {
+                    "@EndUserText.label": "From Change Version",
+                    "type": "cds.Integer64",
+                    "default": "-1"
+                },
+                "TILL_VERSION": {
+                    "@EndUserText.label": "Till Change Version",
+                    "type": "cds.Integer64",
+                    "default": "-1"
+                }
+            },
+            "@Semantics.interval": [
+                {
+                    "qualifier": "changeVersion",
+                    "lowerBoundaryParameter": {
+                        "=": "FROM_VERSION"
+                    },
+                    "lowerBoundaryIncluded": True,
+                    "upperBoundaryParameter": {
+                        "=": "TILL_VERSION"
+                    },
+                    "upperBoundaryIncluded": True
+                }
+            ],
+            "@DataWarehouse.persistence.hdlf.tableFormat": {
+                "#": "DELTA_LAKE"
+            },
+            "@cds.persistence.udf": True,
+            "elements": delta_elements,
+            "_meta": {
+                "dependencies": {
+                    "folderAssignment": None
+                }
+            }
+        }
+
+        # 2. Active Local Table Entity Definition
+        active_entity = {
+            "kind": "entity",
+            "@EndUserText.label": view_name,
+            "@ObjectModel.modelingPattern": {
+                "#": "DATA_STRUCTURE"
+            },
+            "@ObjectModel.supportedCapabilities": [
+                {
+                    "#": "DATA_STRUCTURE"
+                }
+            ],
+            "@DataWarehouse.delta": {
+                "type": {
+                    "#": "ACTIVE"
+                },
+                "deltaFromEntities": [
+                    delta_table_name
+                ]
+            },
+            "@DataWarehouse.persistence.hdlf.tableFormat": {
+                "#": "DELTA_LAKE"
+            },
+            "elements": business_elements,
+            "_meta": {
+                "dependencies": {
+                    "folderAssignment": None
+                }
+            }
+        }
+
+        # 3. Replication Flow Body
         flow_body = {
             "kind": "sap.dis.replicationflow",
             "@EndUserText.label": flow_name,
@@ -623,7 +677,7 @@ class ReplicationOrchestrator:
                             "businessName": view_name
                         },
                         "targetObject": {
-                            "name": table_name,
+                            "name": delta_table_name,
                             "definition": {
                                 "columns": target_cols,
                                 "keys": keys
@@ -652,7 +706,7 @@ class ReplicationOrchestrator:
             },
             "sources": {},
             "targets": {
-                table_name: {
+                delta_table_name: {
                     "elements": target_dict_elems
                 }
             },
@@ -661,44 +715,11 @@ class ReplicationOrchestrator:
             }
         }
 
-        # Format 1: Standard wrapped replication flow object (exact output of 'read')
-        wrapped = {
-            "replicationflows": {
-                flow_name: flow_body
-            }
-        }
-
-        # Format 2: Full CSN bundle containing target table entity definition
+        # Complete official CSN bundle containing target entities and flow
         full_csn = {
             "definitions": {
-                table_name: {
-                    "kind": "entity",
-                    "@EndUserText.label": view_name,
-                    "@ObjectModel.modelingPattern": {
-                        "#": "DATA_STRUCTURE"
-                    },
-                    "@ObjectModel.supportedCapabilities": [
-                        {
-                            "#": "DATA_STRUCTURE"
-                        }
-                    ],
-                    "@DataWarehouse.delta": {
-                        "type": {
-                            "#": "UPSERT"
-                        },
-                        "dateTimeElement": {
-                            "=": "Change_Date"
-                        },
-                        "modeElement": {
-                            "=": "Change_Type"
-                        }
-                    },
-                    "@DataWarehouse.persistence.hdlf.tableFormat": {
-                        "#": "DELTA_LAKE"
-                    },
-                    "@cds.persistence.udf": True,
-                    "elements": entity_elements
-                }
+                delta_table_name: delta_entity,
+                table_name: active_entity
             },
             "version": {
                 "csn": "1.0"
@@ -712,7 +733,14 @@ class ReplicationOrchestrator:
             "$version": "1.0"
         }
 
-        return wrapped, full_csn, flow_body
+        # Wrapped format fallback if needed
+        wrapped = {
+            "replicationflows": {
+                flow_name: flow_body
+            }
+        }
+
+        return full_csn, wrapped, flow_body
 
     def check_flow_exists(self, flow_name: str) -> bool:
         cmd = [
@@ -746,16 +774,16 @@ class ReplicationOrchestrator:
         exists = self.check_flow_exists(flow_name)
         log("FLOW", f"Flow '{flow_name}' existing in space: {exists}")
 
-        wrapped_json, full_csn, bare_json = self.build_flow_definition(flow_name, view_name, table_name)
+        full_csn, wrapped_json, bare_json = self.build_flow_definition(flow_name, view_name, table_name)
 
-        # Use wrapped schema format (verified working with @sap/datasphere-cli)
-        flow_file = Path(self.temp_dir.name) / f"{flow_name}_wrapped.json"
+        # Write official bundled CSN (contains definitions + replicationflows)
+        flow_file = Path(self.temp_dir.name) / f"{flow_name}_csn.json"
         with open(flow_file, "w", encoding="utf-8") as f:
-            json.dump(wrapped_json, f, indent=2)
+            json.dump(full_csn, f, indent=2)
 
-        # Step 1: Initial Create if flow does not exist
+        # Step 1: Initial Save (create if new, update if already exists)
         if not exists:
-            log("FLOW", f"Creating Replication Flow '{flow_name}' for CDS View '{view_name}' (Initial Save)...")
+            log("FLOW", f"Creating Replication Flow '{flow_name}' for CDS View '{view_name}' (Save 1/2)...")
             create_cmd = [
                 "datasphere", "objects", "replication-flows", "create",
                 "--space", self.source_space,
@@ -773,18 +801,29 @@ class ReplicationOrchestrator:
                     log("FLOW", f"Create notice: {err}. Attempting create with --deploy-anyway...", "WARN")
                     cres_anyway = run_cmd(create_cmd + ["--deploy-anyway"])
                     if cres_anyway.returncode != 0:
-                        log("FLOW", f"Clean recreate: resetting draft flow '{flow_name}'...")
+                        log("FLOW", f"Attempting recreate: resetting flow '{flow_name}'...")
                         self.delete_flow_if_exists(flow_name)
                         time.sleep(2)
                         run_cmd(create_cmd)
 
             # Allow Datasphere repository to register initial creation
             time.sleep(3)
+        else:
+            log("FLOW", f"Saving Replication Flow '{flow_name}' with full CSN (Save 1/2)...")
+            run_cmd([
+                "datasphere", "objects", "replication-flows", "update",
+                "--space", self.source_space,
+                "--technical-name", flow_name,
+                "--file-path", str(flow_file),
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host
+            ])
+            time.sleep(3)
 
-        # Step 2: Update / Save Again to materialize target objects and deploy!
+        # Step 2: Save once again to materialize target objects and deploy! (Save 2/2)
         # As per SAP Datasphere requirement: "Now the objects are already created when the replication flow is saved.
         # You need to save the replication flow once again before deploying it so that the new objects are included correctly."
-        log("FLOW", f"Updating / Saving Replication Flow '{flow_name}' once again to materialize target objects ({table_name}) and deploy...")
+        log("FLOW", f"Saving Replication Flow '{flow_name}' once again to materialize target objects ({table_name}) and deploy (Save 2/2)...")
         update_cmd = [
             "datasphere", "objects", "replication-flows", "update",
             "--space", self.source_space,
@@ -805,25 +844,33 @@ class ReplicationOrchestrator:
             log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed with --deploy-anyway.")
             return True
 
-        # Fallback with bare JSON format if wrapped had schema rejection
-        bare_file = Path(self.temp_dir.name) / f"{flow_name}_bare.json"
-        with open(bare_file, "w", encoding="utf-8") as f:
-            json.dump(bare_json, f, indent=2)
+        # If existing flow was in corrupted/inconsistent state, clean recreate
+        if exists:
+            log("FLOW", f"Re-creating flow '{flow_name}' cleanly with full CSN...", "WARN")
+            self.delete_flow_if_exists(flow_name)
+            time.sleep(3)
+            cres2 = run_cmd([
+                "datasphere", "objects", "replication-flows", "create",
+                "--space", self.source_space,
+                "--technical-name", flow_name,
+                "--file-path", str(flow_file),
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host
+            ])
+            time.sleep(3)
+            ures2 = run_cmd([
+                "datasphere", "objects", "replication-flows", "update",
+                "--space", self.source_space,
+                "--technical-name", flow_name,
+                "--file-path", str(flow_file),
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host
+            ])
+            if ures2.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully recreated and deployed.")
+                return True
 
-        log("FLOW", "Attempting update with bare JSON schema format...", "WARN")
-        ures_bare = run_cmd([
-            "datasphere", "objects", "replication-flows", "update",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(bare_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ])
-        if ures_bare.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully updated with bare schema.")
-            return True
-
-        log("FLOW", f"Failed to save/deploy Replication Flow '{flow_name}': {ures_bare.stderr or ures_bare.stdout}", "ERROR")
+        log("FLOW", f"Failed to save/deploy Replication Flow '{flow_name}': {ures_anyway.stderr or ures_anyway.stdout}", "ERROR")
         return False
 
     def execute_flow(self, flow_name: str) -> bool:
@@ -881,32 +928,33 @@ class ReplicationOrchestrator:
     def validate_local_table(self, table_name: str, view_name: str = "") -> tuple:
         log("TABLE", f"Validating replicated Local Table '{table_name}' in space '{self.source_space}'...")
 
-        # 1. Discover existing tables via local-tables list
-        list_cmd = [
-            "datasphere", "objects", "local-tables", "list",
-            "--space", self.source_space,
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        lres = run_cmd(list_cmd)
+        # 1. Discover existing tables via local-tables list (with retries to allow indexing)
         tables_found = []
         actual_table_name = table_name
 
-        if lres.returncode == 0 and lres.stdout:
-            try:
-                data = json.loads(lres.stdout.strip())
-                if isinstance(data, list):
-                    tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in data]
-                elif isinstance(data, dict):
-                    items = data.get("value", data.get("objects", []))
-                    tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in items]
-            except Exception:
-                for line in lres.stdout.splitlines():
-                    parts = line.strip().split()
-                    if parts and not parts[0].startswith("-") and parts[0].lower() not in ("technical", "name", "id"):
-                        tables_found.append(parts[0])
+        for attempt in range(1, 4):
+            list_cmd = [
+                "datasphere", "objects", "local-tables", "list",
+                "--space", self.source_space,
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host
+            ]
+            lres = run_cmd(list_cmd)
+            tables_found = []
 
-            log("TABLE", f"Local tables found in space '{self.source_space}': {tables_found}")
+            if lres.returncode == 0 and lres.stdout:
+                try:
+                    data = json.loads(lres.stdout.strip())
+                    if isinstance(data, list):
+                        tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in data]
+                    elif isinstance(data, dict):
+                        items = data.get("value", data.get("objects", []))
+                        tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in items]
+                except Exception:
+                    for line in lres.stdout.splitlines():
+                        parts = line.strip().split()
+                        if parts and not parts[0].startswith("-") and parts[0].lower() not in ("technical", "name", "id"):
+                            tables_found.append(parts[0])
 
             # Match target table in listing (exact -> case-insensitive -> view-based)
             matched = None
@@ -919,10 +967,16 @@ class ReplicationOrchestrator:
                     break
                 elif view_name and (view_name.upper() in t.upper() or t.upper() in f"{self.table_prefix}{view_name}".upper()):
                     matched = t
+                    break
 
             if matched:
                 actual_table_name = matched
                 log("TABLE", f"Matched local table '{actual_table_name}' in space '{self.source_space}'.")
+                break
+            else:
+                log("TABLE", f"Attempt {attempt}/3: Local tables currently found in space '{self.source_space}': {tables_found}")
+                if attempt < 3:
+                    time.sleep(5)
 
         # 2. Read the local table definition
         table_output = Path(self.temp_dir.name) / f"{actual_table_name}_def.json"
@@ -1236,12 +1290,7 @@ class ReplicationOrchestrator:
                     "details": ""
                 }
 
-                # Step 1: Pre-create and deploy target Local Table in the space
-                # This ensures the target table exists as an active, saved object in SAP Datasphere,
-                # permanently resolving the 'There are unsaved target objects. Please save again' issue.
-                self.create_or_update_local_table(table_name, view)
-
-                # Step 2: Create or Update Replication Flow
+                # Step 1: Create or Update Replication Flow (Bundles flow & target entities in full CSN)
                 created = self.create_or_update_flow(flow_name, view, table_name)
                 if not created:
                     self.results[view]["flow_status"] = "CONFIG_FAILED"
