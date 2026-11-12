@@ -2,19 +2,7 @@
 """
 SAP Datasphere Replication Flows Orchestrator
 ---------------------------------------------
-Automates the end-to-end lifecycle of SAP Datasphere Replication Flows on GitHub Actions runners:
-1. Parse CDS View names from cds_views.txt.
-2. Detect changed/new CDS Views compared to previous commit.
-3. Validate credentials and connection to SAP Datasphere.
-4. Validate CDS Views and connection objects.
-5. Generate replication plan.
-6. Create/Update and deploy Replication Flows via @sap/datasphere-cli.
-7. Execute Replication Flows.
-8. Monitor execution until completion.
-9. Validate replicated Local Tables.
-10. Share Local Tables with configured Consumer Spaces.
-11. Validate Space Sharing.
-12. Output detailed markdown and JSON execution reports.
+Automates the end-to-end lifecycle of SAP Datasphere Replication Flows on GitHub Actions runners.
 """
 
 import os
@@ -33,23 +21,19 @@ from pathlib import Path
 
 def log(stage: str, message: str, level: str = "INFO"):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    prefix = f"[{timestamp}] [{level}] [{stage}]"
-    print(f"{prefix} {message}", flush=True)
+    print(f"[{timestamp}] [{level}] [{stage}] {message}", flush=True)
 
 
-def run_cmd(command: list, check: bool = False, capture: bool = True, env: dict = None) -> subprocess.CompletedProcess:
+def run_cmd(command: list, capture: bool = True, env: dict = None) -> subprocess.CompletedProcess:
     cmd_str = " ".join(command)
-    # Mask secrets in logs
     masked_cmd = cmd_str
     client_secret = os.getenv("CLIENT_SECRET")
     if client_secret and client_secret in masked_cmd:
         masked_cmd = masked_cmd.replace(client_secret, "******")
-
     log("EXEC", f"Running: {masked_cmd}")
     run_env = os.environ.copy()
     if env:
         run_env.update(env)
-
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE if capture else None,
@@ -57,12 +41,6 @@ def run_cmd(command: list, check: bool = False, capture: bool = True, env: dict 
         text=True,
         env=run_env
     )
-
-    if result.returncode != 0 and check:
-        err_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
-        log("ERROR", f"Command failed with code {result.returncode}: {err_msg}", "ERROR")
-        raise RuntimeError(f"Command failed: {masked_cmd}\nError: {err_msg}")
-
     return result
 
 
@@ -78,25 +56,20 @@ class ReplicationOrchestrator:
         self.source_space = os.getenv("SOURCE_SPACE", "").strip()
         self.source_conn = os.getenv("SOURCE_CONNECTION", "").strip()
         self.source_container = os.getenv("SOURCE_CONTAINER", "CDS_EXTRACTION").strip()
-        self.target_conn = os.getenv("TARGET_CONNECTION", "DATASPHERE_LOCAL").strip()
+        self.target_conn = os.getenv("TARGET_CONNECTION", "DWC_HDLF").strip()
         self.load_type = os.getenv("LOAD_TYPE", "INITIAL").strip().upper()
         self.flow_prefix = os.getenv("FLOW_PREFIX", "RF_").strip()
         self.table_prefix = os.getenv("TABLE_PREFIX", "LT_").strip()
-        
-        # Comma-separated consumer spaces
+
         consumer_spaces_env = os.getenv("CONSUMER_SPACES", "").strip()
         self.consumer_spaces = [s.strip() for s in consumer_spaces_env.split(",") if s.strip()] if consumer_spaces_env else []
 
-        # Polling and timeouts
         self.poll_interval = int(os.getenv("STATUS_POLL_INTERVAL_SEC", "15"))
         self.timeout_sec = int(os.getenv("STATUS_TIMEOUT_SEC", "600"))
 
         self.temp_dir = tempfile.TemporaryDirectory()
         self.secrets_path = Path(self.temp_dir.name) / "datasphere_secrets.json"
-        self.template = {}
         self.access_token = None
-        
-        # Results tracking
         self.results = {}
         self.report_dir = Path("reports")
         self.report_dir.mkdir(exist_ok=True)
@@ -107,33 +80,25 @@ class ReplicationOrchestrator:
         except Exception:
             pass
 
+    @property
+    def source_connection(self):
+        return self.source_conn
+
     def validate_environment(self):
         log("INIT", "Validating required secrets and environment variables...")
         missing = []
-        if not self.host:
-            missing.append("DATASPHERE_HOST")
-        if not self.client_id:
-            missing.append("CLIENT_ID")
-        if not self.client_secret:
-            missing.append("CLIENT_SECRET")
-        if not self.auth_url:
-            missing.append("AUTHORIZATION_URL")
-        if not self.token_url:
-            missing.append("TOKEN_URL")
-        if not self.source_space:
-            missing.append("SOURCE_SPACE")
-        if not self.source_connection:
-            missing.append("SOURCE_CONNECTION")
-
+        for var, val in [("DATASPHERE_HOST", self.host), ("CLIENT_ID", self.client_id),
+                         ("CLIENT_SECRET", self.client_secret), ("AUTHORIZATION_URL", self.auth_url),
+                         ("TOKEN_URL", self.token_url), ("SOURCE_SPACE", self.source_space),
+                         ("SOURCE_CONNECTION", self.source_conn)]:
+            if not val:
+                missing.append(var)
         if missing:
             msg = f"Missing required environment variables/secrets: {', '.join(missing)}"
             log("INIT", msg, "ERROR")
             raise ValueError(msg)
-
-        # Normalize host URL
-        if not self.host.startswith("http://") and not self.host.startswith("https://"):
+        if not self.host.startswith("http"):
             self.host = f"https://{self.host}"
-        
         log("INIT", f"Target Host: {self.host}")
         log("INIT", f"Source Space: {self.source_space}")
         log("INIT", f"Source Connection: {self.source_conn}")
@@ -141,68 +106,51 @@ class ReplicationOrchestrator:
         log("INIT", f"Load Type: {self.load_type}")
         log("INIT", f"Consumer Spaces: {', '.join(self.consumer_spaces) if self.consumer_spaces else 'None'}")
 
-    @property
-    def source_connection(self):
-        return self.source_conn
-
     def read_cds_views(self) -> list:
         log("INPUT", f"Reading CDS Views from {self.cds_file}...")
         if not self.cds_file.exists():
             raise FileNotFoundError(f"Input file not found: {self.cds_file}")
-
         views = []
         with open(self.cds_file, "r", encoding="utf-8") as f:
             for line in f:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):
                     continue
-                # Extract clean view name
-                view_name = stripped.split()[0].upper()
-                if view_name not in views:
-                    views.append(view_name)
-
+                vname = stripped.split()[0].upper()
+                if vname not in views:
+                    views.append(vname)
         log("INPUT", f"Total active CDS Views in file: {len(views)} ({', '.join(views)})")
         return views
 
     def detect_changes(self, all_views: list) -> list:
-        """
-        Detect newly added or modified CDS Views by checking git diff.
-        If git history is unavailable or full run is requested, return all views.
-        """
         log("CHANGE_DETECT", "Checking for changes in CDS Views compared to previous commit...")
         force_all = os.getenv("FORCE_REPLICATE_ALL", "false").lower() in ("true", "1", "yes")
         if force_all:
             log("CHANGE_DETECT", "FORCE_REPLICATE_ALL is enabled. Processing all CDS Views.")
             return all_views
-
         try:
             diff_res = run_cmd(["git", "diff", "-U0", "HEAD~1", "HEAD", "--", str(self.cds_file)])
             if diff_res.returncode == 0 and diff_res.stdout:
                 changed_views = []
                 for line in diff_res.stdout.splitlines():
-                    # Look for added lines starting with '+'
                     if line.startswith("+") and not line.startswith("+++"):
                         val = line[1:].strip()
                         if val and not val.startswith("#"):
                             vname = val.split()[0].upper()
                             if vname in all_views and vname not in changed_views:
                                 changed_views.append(vname)
-                
                 if changed_views:
                     log("CHANGE_DETECT", f"Detected newly added/modified CDS Views: {', '.join(changed_views)}")
                     return changed_views
                 else:
-                    log("CHANGE_DETECT", "No new CDS views added in git diff; reviewing all defined views for drift/idempotency.")
+                    log("CHANGE_DETECT", "No new CDS views in git diff; processing all defined views.")
                     return all_views
         except Exception as e:
-            log("CHANGE_DETECT", f"Git diff check skipped ({e}). Falling back to processing all views.")
-
+            log("CHANGE_DETECT", f"Git diff skipped ({e}). Falling back to all views.")
         return all_views
 
     def authenticate_datasphere(self):
-        log("AUTH", f"Configuring authentication for @sap/datasphere-cli (Flow: {self.auth_flow})...")
-        
-        # 1. Pre-fetch OAuth2 access token for Technical User (client_credentials)
+        log("AUTH", f"Configuring authentication (Flow: {self.auth_flow})...")
         access_token = None
         try:
             auth_header = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
@@ -217,7 +165,6 @@ class ReplicationOrchestrator:
                     self.access_token = access_token
                     log("AUTH", "Successfully pre-fetched OAuth2 access token for technical user.")
         except Exception as e:
-            # Fallback attempt with credentials in POST body
             try:
                 body_data = urllib.parse.urlencode({
                     "grant_type": "client_credentials",
@@ -230,25 +177,18 @@ class ReplicationOrchestrator:
                     token_resp = json.loads(resp.read().decode())
                     access_token = token_resp.get("access_token")
                     if access_token:
-                        log("AUTH", "Successfully pre-fetched OAuth2 access token for technical user (via body).")
+                        log("AUTH", "Successfully pre-fetched OAuth2 access token (via body).")
             except Exception as e2:
-                log("AUTH", f"Direct token fetch notice ({e2}). Proceeding with datasphere login CLI command.", "WARN")
+                log("AUTH", f"Direct token fetch notice ({e2}). Proceeding with CLI login.", "WARN")
 
-        # 2. Write secrets and options payload (covering both camelCase, snake_case, and kebab-case)
         secrets_payload = {
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "authorization_url": self.auth_url,
-            "token_url": self.token_url,
+            "client_id": self.client_id, "client_secret": self.client_secret,
+            "authorization_url": self.auth_url, "token_url": self.token_url,
             "authorization_flow": self.auth_flow,
-            "client-id": self.client_id,
-            "client-secret": self.client_secret,
-            "authorization-url": self.auth_url,
-            "token-url": self.token_url,
-            "authorization-flow": self.auth_flow,
-            "host": self.host
+            "client-id": self.client_id, "client-secret": self.client_secret,
+            "authorization-url": self.auth_url, "token-url": self.token_url,
+            "authorization-flow": self.auth_flow, "host": self.host
         }
-
         if access_token:
             secrets_payload["access_token"] = access_token
             secrets_payload["access-token"] = access_token
@@ -256,55 +196,33 @@ class ReplicationOrchestrator:
         with open(self.secrets_path, "w", encoding="utf-8") as f:
             json.dump(secrets_payload, f, indent=2)
 
-        # 3. Login using datasphere login with explicit authorization-flow
-        login_cmd = [
-            "datasphere", "login",
-            "--host", self.host,
-            "--authorization-flow", self.auth_flow,
-            "--secrets-file", str(self.secrets_path)
-        ]
-        res = run_cmd(login_cmd)
+        res = run_cmd(["datasphere", "login", "--host", self.host,
+                       "--authorization-flow", self.auth_flow,
+                       "--secrets-file", str(self.secrets_path)])
         if res.returncode != 0:
             err = res.stderr or res.stdout
-            # If access_token was already obtained, the secrets file can still authenticate CLI calls
             if access_token:
-                log("AUTH", f"datasphere login notice: {err}. Proceeding with verified bearer token in secrets-file.", "WARN")
+                log("AUTH", f"datasphere login notice: {err}. Proceeding with bearer token.", "WARN")
             else:
                 log("AUTH", f"datasphere login failed: {err}", "ERROR")
-                raise RuntimeError(f"Authentication with SAP Datasphere failed: {err}")
+                raise RuntimeError(f"Authentication failed: {err}")
         else:
             log("AUTH", "Successfully authenticated with SAP Datasphere CLI.")
 
     def validate_connection(self):
         log("VALIDATE", f"Validating source connection '{self.source_conn}' in space '{self.source_space}'...")
-        conn_cmd = [
-            "datasphere", "spaces", "connections", "list",
-            "--space", self.source_space,
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        res = run_cmd(conn_cmd)
+        res = run_cmd(["datasphere", "spaces", "connections", "list",
+                       "--space", self.source_space,
+                       "--secrets-file", str(self.secrets_path),
+                       "--host", self.host])
         if res.returncode != 0:
-            log("VALIDATE", f"Warning: Connection check returned code {res.returncode}: {res.stderr or res.stdout}", "WARN")
+            log("VALIDATE", f"Connection check warning: {res.stderr or res.stdout}", "WARN")
+        elif self.source_conn in (res.stdout or ""):
+            log("VALIDATE", f"Source connection '{self.source_conn}' verified.")
         else:
-            output = res.stdout
-            if self.source_conn in output:
-                log("VALIDATE", f"Source connection '{self.source_conn}' verified in space '{self.source_space}'.")
-            else:
-                log("VALIDATE", f"Connection '{self.source_conn}' not explicitly found in listing output; will attempt replication flow execution.", "WARN")
-
-    def get_load_type_name(self) -> str:
-        if "DELTA" in self.load_type:
-            return "InitialAndDelta"
-        return "InitialOnly"
+            log("VALIDATE", f"Connection '{self.source_conn}' not found in listing; will attempt anyway.", "WARN")
 
     def _build_vtypes(self, columns: list) -> dict:
-        """
-        Builds the vTypes.scalar dict required by SAP Datasphere CSN for replication flows.
-        Each unique type referenced via $DYNAMIC.<type> in column vtype-IDs must have an entry.
-        This is REQUIRED by the Datasphere CSN parser - omitting it causes
-        'Failed to create an object from a JSON file or input string'.
-        """
         vtypes = {}
         for col in columns:
             vtype_id = col.get("vtype-ID", "")
@@ -313,54 +231,32 @@ class ReplicationOrchestrator:
             type_key = vtype_id[len("$DYNAMIC."):]
             if type_key in vtypes:
                 continue
-            # Parse type from key e.g. string_5, decimal_21_7, int_2
             if type_key.startswith("string_"):
                 try:
                     length = int(type_key.split("_", 1)[1])
-                    vtypes[type_key] = {
-                        "name": type_key,
-                        "description": f"String({length})",
-                        "vflow.type": "scalar",
-                        "template": "string",
-                        "value.length": length
-                    }
+                    vtypes[type_key] = {"name": type_key, "description": f"String({length})",
+                                        "vflow.type": "scalar", "template": "string", "value.length": length}
                 except ValueError:
                     pass
             elif type_key.startswith("decimal_"):
                 parts = type_key.split("_")
                 try:
-                    precision = int(parts[1])
-                    scale = int(parts[2])
-                    vtypes[type_key] = {
-                        "name": type_key,
-                        "description": f"Decimal({precision},{scale})",
-                        "vflow.type": "scalar",
-                        "template": "decimal",
-                        "value.precision": precision,
-                        "value.scale": scale
-                    }
+                    p, s = int(parts[1]), int(parts[2])
+                    vtypes[type_key] = {"name": type_key, "description": f"Decimal({p},{s})",
+                                        "vflow.type": "scalar", "template": "decimal",
+                                        "value.precision": p, "value.scale": s}
                 except (IndexError, ValueError):
                     pass
             elif type_key.startswith("int_"):
                 try:
                     length = int(type_key.split("_", 1)[1])
-                    vtypes[type_key] = {
-                        "name": type_key,
-                        "description": f"Integer({length})",
-                        "vflow.type": "scalar",
-                        "template": "integer",
-                        "value.length": length
-                    }
+                    vtypes[type_key] = {"name": type_key, "description": f"Integer({length})",
+                                        "vflow.type": "scalar", "template": "integer", "value.length": length}
                 except ValueError:
                     pass
         return vtypes
 
     def get_cds_view_schema(self, view_name: str, table_name: str) -> tuple:
-        """
-        Returns (source_cols, keys, target_cols, target_dict_elems, business_elements, delta_elements)
-        Strictly conforms to official SAP Datasphere Replication Flow CSN specification
-        verified against live tenant exports (RF_SALES_TEST targeting DWC_HDLF / Delta Lake).
-        """
         v = view_name.upper()
         if v == "I_CURRENCY":
             keys = ["Currency"]
@@ -380,129 +276,30 @@ class ReplicationOrchestrator:
                 {"name": "CurrencyShortName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_15", "businessName": "Short text", "metadata": {}}
             ]
         else:
-            # Fallback for dynamic/arbitrary CDS view
             keys = [f"{view_name}_KEY"]
             source_cols = [
-                {"name": f"{view_name}_KEY", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50", "key": True, "businessName": f"{view_name} Key", "metadata": {}}
+                {"name": f"{view_name}_KEY", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50",
+                 "key": True, "businessName": f"{view_name} Key", "metadata": {}}
             ]
 
-        # Target columns: business columns + Change_Type ($DYNAMIC.string_1) + Change_Date (com.sap.core.timestamp)
         target_cols = [dict(c) for c in source_cols] + [
             {"name": "Change_Type", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "metadata": {}},
             {"name": "Change_Date", "vflow.type": "scalar", "vtype-ID": "com.sap.core.timestamp", "metadata": {}}
         ]
-
-        # Target dict elements for flow 'targets' map
         target_dict_elems = {col["name"]: {} for col in target_cols}
+        return source_cols, keys, target_cols, target_dict_elems
 
-        # 1. Business elements for active Local Table entity
-        business_elements = {}
-        for col in source_cols:
-            cname = col["name"]
-            vtype = col.get("vtype-ID", "")
-            is_key = col.get("key", False)
-            blabel = col.get("businessName", cname)
-            if "string" in vtype:
-                try:
-                    l = int(vtype.split("_")[1])
-                except Exception:
-                    l = 50
-                elem = {
-                    "@EndUserText.label": blabel,
-                    "type": "cds.String",
-                    "key": is_key,
-                    "length": l
-                }
-                if is_key:
-                    elem["notNull"] = True
-                business_elements[cname] = elem
-            elif "decimal" in vtype:
-                parts = vtype.split("_")
-                try:
-                    p = int(parts[1])
-                    s = int(parts[2])
-                except Exception:
-                    p, s = 21, 7
-                elem = {
-                    "@EndUserText.label": blabel,
-                    "type": "cds.Decimal",
-                    "key": is_key,
-                    "precision": p,
-                    "scale": s
-                }
-                if is_key:
-                    elem["notNull"] = True
-                business_elements[cname] = elem
-            elif "int" in vtype:
-                elem = {
-                    "@EndUserText.label": blabel,
-                    "type": "cds.Integer",
-                    "key": is_key
-                }
-                if is_key:
-                    elem["notNull"] = True
-                business_elements[cname] = elem
-            else:
-                elem = {
-                    "@EndUserText.label": blabel,
-                    "type": "cds.String",
-                    "key": is_key,
-                    "length": 50
-                }
-                if is_key:
-                    elem["notNull"] = True
-                business_elements[cname] = elem
-
-        # 2. Delta elements for Delta Capture entity (business elements + Change_Type + Change_Date)
-        delta_elements = dict(business_elements)
-        delta_elements["Change_Type"] = {
-            "@EndUserText.label": "Change_Type",
-            "type": "cds.String",
-            "key": False,
-            "notNull": True,
-            "length": 1,
-            "default": {
-                "val": "I"
-            }
-        }
-        delta_elements["Change_Date"] = {
-            "@EndUserText.label": "Change_Date",
-            "type": "cds.Timestamp",
-            "key": False,
-            "notNull": True,
-            "default": {
-                "func": "CURRENT_UTCTIMESTAMP"
-            }
-        }
-
-        return source_cols, keys, target_cols, target_dict_elems, business_elements, delta_elements
-
-    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str) -> tuple:
+    def build_flow_json(self, flow_name: str, view_name: str, table_name: str, is_new: bool) -> dict:
         """
-        Builds the SAP Datasphere Replication Flow definition.
-        Returns:
-            (wrapped_flow_json, bare_flow_json)
-        
-        Strictly conforms to official SAP Datasphere Replication Flow specifications:
-        - loadType: INITIAL (strictly Initial Only)
-        - isDeltaDisabled: True
-        - Skip Unmapped Columns: hasSkipMappingCapability = True
-        - Content Type: ABAPcontentType = "Native Type", ABAPcontentTypeDisabled = False
-        - Auto-merge: isAutoMergeEnabledForTarget = True
-        - Target properties: com.sap.datasuite.tableCategory = DELTA, cdc mode & timestamp columns
+        Build the wrapped replication flow JSON payload.
+        is_new=True  -> Phase 1 create: tells Datasphere this target object is NEW and must be provisioned.
+        is_new=False -> Phase 2+ update/deploy: target object already registered.
         """
-        load_type_val = "INITIAL"
-
-        target_conn_id = self.target_conn if self.target_conn else "DWC_HDLF"
-        if target_conn_id in ("DATASPHERE_LOCAL", ""):
-            target_conn_id = "DWC_HDLF"
+        target_conn_id = self.target_conn if self.target_conn not in ("DATASPHERE_LOCAL", "", None) else "DWC_HDLF"
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
-
         source_container = f"/{self.source_container.lstrip('/')}"
 
-        source_cols, keys, target_cols, target_dict_elems, *rest = self.get_cds_view_schema(view_name, table_name)
-
-        # Build vTypes registry from all columns with $DYNAMIC types
+        source_cols, keys, target_cols, target_dict_elems = self.get_cds_view_schema(view_name, table_name)
         all_cols = source_cols + target_cols
         vtypes_scalar = self._build_vtypes(all_cols)
 
@@ -511,84 +308,56 @@ class ReplicationOrchestrator:
             "@EndUserText.label": flow_name,
             "contents": {
                 "description": flow_name,
-                "sourceSystem": [
-                    {
-                        "connectionId": self.source_conn,
-                        "connectionType": "SAPS4HANAOP",
-                        "container": source_container,
-                        "maxConnections": 10,
-                        "isGeneric": False,
-                        "metadata": {}
+                "sourceSystem": [{
+                    "connectionId": self.source_conn,
+                    "connectionType": "SAPS4HANAOP",
+                    "container": source_container,
+                    "maxConnections": 10,
+                    "isGeneric": False,
+                    "metadata": {}
+                }],
+                "targetSystem": [{
+                    "connectionId": target_conn_id,
+                    "connectionType": target_conn_type,
+                    "container": "",
+                    "maxConnections": 10,
+                    "isGeneric": False,
+                    "metadata": {"connectionMetaschema": {"sources": ["SAP"]}},
+                    "properties": {
+                        "compression": "SNAPPY",
+                        "format": "PARQUET",
+                        "groupDeltaFilesBy": "NONE",
+                        "com.sap.rms.write.forceDecfloatsToTargetValueRange": "false",
+                        "objectstore.write.useDuplicateSuppressionInitialLoad": "false",
+                        "objectstore.write.parquet.compatibilityMode": "SPARK",
+                        "objectstore.write.createLargePartFiles": "false"
                     }
-                ],
-                "targetSystem": [
-                    {
-                        "connectionId": target_conn_id,
-                        "connectionType": target_conn_type,
-                        "container": "",
-                        "maxConnections": 10,
-                        "isGeneric": False,
-                        "metadata": {
-                            "connectionMetaschema": {
-                                "sources": ["SAP"]
-                            }
-                        },
+                }],
+                "vTypes": {"scalar": vtypes_scalar},
+                "replicationTasks": [{
+                    "name": "replicationtask1",
+                    "loadType": "INITIAL",
+                    "priority": 50,
+                    "truncate": False,
+                    "sourceObject": {
+                        "name": view_name,
+                        "definition": {"columns": source_cols, "keys": keys},
+                        "metadata": {"type": "tabular", "isDeltaDisabled": True, "invalidColumns": ["/1DH/OPERATION"]},
+                        "businessName": view_name
+                    },
+                    "targetObject": {
+                        "name": table_name,
+                        "definition": {"columns": target_cols, "keys": keys},
+                        "metadata": {"isNew": is_new},
                         "properties": {
-                            "compression": "SNAPPY",
-                            "format": "PARQUET",
-                            "groupDeltaFilesBy": "NONE",
-                            "com.sap.rms.write.forceDecfloatsToTargetValueRange": "false",
-                            "objectstore.write.useDuplicateSuppressionInitialLoad": "false",
-                            "objectstore.write.parquet.compatibilityMode": "SPARK",
-                            "objectstore.write.createLargePartFiles": "false"
-                        }
-                    }
-                ],
-                "vTypes": {
-                    "scalar": vtypes_scalar
-                },
-                "replicationTasks": [
-                    {
-                        "name": "replicationtask1",
-                        "loadType": load_type_val,
-                        "priority": 50,
-                        "truncate": False,
-                        "sourceObject": {
-                            "name": view_name,
-                            "definition": {
-                                "columns": source_cols,
-                                "keys": keys
-                            },
-                            "metadata": {
-                                "type": "tabular",
-                                "isDeltaDisabled": True,
-                                "invalidColumns": [
-                                    "/1DH/OPERATION"
-                                ]
-                            },
-                            "businessName": view_name
+                            "com.sap.datasuite.cdc.mode.column": "Change_Type",
+                            "com.sap.datasuite.cdc.timestamp.column": "Change_Date",
+                            "com.sap.datasuite.tableCategory": "DELTA"
                         },
-                        "targetObject": {
-                            "name": table_name,
-                            "definition": {
-                                "columns": target_cols,
-                                "keys": keys
-                            },
-                            "metadata": {
-                                "isNew": False
-                            },
-                            "properties": {
-                                "com.sap.datasuite.cdc.mode.column": "Change_Type",
-                                "com.sap.datasuite.cdc.timestamp.column": "Change_Date",
-                                "com.sap.datasuite.tableCategory": "DELTA"
-                            },
-                            "businessName": view_name
-                        }
+                        "businessName": view_name
                     }
-                ],
-                "replicationTaskSetting": {
-                    "hasSkipMappingCapability": True
-                },
+                }],
+                "replicationTaskSetting": {"hasSkipMappingCapability": True},
                 "replicationFlowSetting": {
                     "ABAPcontentTypeDisabled": False,
                     "ABAPcontentType": "Native Type",
@@ -597,505 +366,283 @@ class ReplicationOrchestrator:
                 "deltaLoadTrigger": "ON_DELTA_INTERVAL"
             },
             "sources": {},
-            "targets": {
-                table_name: {
-                    "elements": target_dict_elems
-                }
-            },
-            "connections": {
-                self.source_conn: {}
-            }
+            "targets": {table_name: {"elements": target_dict_elems}},
+            "connections": {self.source_conn: {}}
         }
 
-        # Standard wrapped replication flow object accepted by datasphere objects replication-flows
-        wrapped = {
-            "replicationflows": {
-                flow_name: flow_body
-            }
-        }
+        return {"replicationflows": {flow_name: flow_body}}
 
-        return wrapped, flow_body
+    def _write_json(self, name: str, data: dict) -> Path:
+        path = Path(self.temp_dir.name) / f"{name}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return path
+
+    def _rf_cmd(self, action: str, flow_name: str, file_path: Path, extra: list = None) -> subprocess.CompletedProcess:
+        cmd = ["datasphere", "objects", "replication-flows", action,
+               "--space", self.source_space,
+               "--technical-name", flow_name,
+               "--file-path", str(file_path),
+               "--secrets-file", str(self.secrets_path),
+               "--host", self.host]
+        if extra:
+            cmd += extra
+        return run_cmd(cmd)
 
     def check_flow_exists(self, flow_name: str) -> bool:
-        cmd = [
-            "datasphere", "objects", "replication-flows", "read",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        res = run_cmd(cmd)
+        res = run_cmd(["datasphere", "objects", "replication-flows", "read",
+                       "--space", self.source_space,
+                       "--technical-name", flow_name,
+                       "--secrets-file", str(self.secrets_path),
+                       "--host", self.host])
         return res.returncode == 0
 
     def delete_flow_if_exists(self, flow_name: str):
-        """Attempt to delete an existing (draft) flow to allow clean creation."""
-        log("FLOW", f"Attempting to delete existing draft flow '{flow_name}' for clean recreation...")
-        cmd = [
-            "datasphere", "objects", "replication-flows", "delete",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host,
-            "--no-interaction"
-        ]
-        res = run_cmd(cmd)
+        log("FLOW", f"Attempting to delete existing flow '{flow_name}'...")
+        res = run_cmd(["datasphere", "objects", "replication-flows", "delete",
+                       "--space", self.source_space,
+                       "--technical-name", flow_name,
+                       "--secrets-file", str(self.secrets_path),
+                       "--host", self.host,
+                       "--no-interaction"])
         if res.returncode == 0:
-            log("FLOW", f"Deleted existing flow '{flow_name}' successfully.")
+            log("FLOW", f"Deleted flow '{flow_name}' successfully.")
         else:
-            log("FLOW", f"Could not delete flow '{flow_name}' (may be deployed/running): {res.stderr or res.stdout}", "WARN")
+            log("FLOW", f"Could not delete flow '{flow_name}': {res.stderr or res.stdout}", "WARN")
 
     def create_or_update_flow(self, flow_name: str, view_name: str, table_name: str) -> bool:
+        """
+        SAP Datasphere mandatory lifecycle for target objects in HDL_FILES (Delta Lake):
+
+        Phase 1: Create/Save with isNew=True + --no-deploy --save-anyway
+                 Signals Datasphere to PROVISION a new target object (registers it as draft).
+        Phase 2: Save again with isNew=False + --no-deploy --save-anyway
+                 SAP-mandated "save once again before deploy" so new objects are included correctly.
+        Phase 3: Deploy with isNew=False + --deploy-anyway
+                 Materializes the target table as dark/active in the UI.
+        """
         exists = self.check_flow_exists(flow_name)
-        log("FLOW", f"Flow '{flow_name}' existing in space: {exists}")
+        log("FLOW", f"Flow '{flow_name}' already exists: {exists}")
 
-        wrapped_json, bare_json = self.build_flow_definition(flow_name, view_name, table_name)
+        # Prepare two payloads
+        file_new = self._write_json(f"{flow_name}_phase1_isNew_true",
+                                    self.build_flow_json(flow_name, view_name, table_name, is_new=True))
+        file_existing = self._write_json(f"{flow_name}_phase2_isNew_false",
+                                         self.build_flow_json(flow_name, view_name, table_name, is_new=False))
 
-        flow_file = Path(self.temp_dir.name) / f"{flow_name}_wrapped.json"
-        with open(flow_file, "w", encoding="utf-8") as f:
-            json.dump(wrapped_json, f, indent=2)
-
-        # -----------------------------------------------------------------
-        # Phase 1: Save 1/2 without deploying (--no-deploy --save-anyway)
-        # Allows SAP Datasphere to register the flow and target objects as draft
-        # -----------------------------------------------------------------
+        # --- Phase 1: Save with isNew=True ---
         if not exists:
-            log("FLOW", f"Creating Replication Flow '{flow_name}' (Save 1/2 with --no-deploy)...")
-            create_cmd = [
-                "datasphere", "objects", "replication-flows", "create",
-                "--space", self.source_space,
-                "--technical-name", flow_name,
-                "--file-path", str(flow_file),
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host,
-                "--no-deploy",
-                "--save-anyway"
-            ]
-            cres = run_cmd(create_cmd)
-            if cres.returncode != 0:
-                err = (cres.stderr or cres.stdout).strip()
-                log("FLOW", f"Notice on create with --no-deploy ({err}). Retrying standard create...", "WARN")
-                cres = run_cmd([
-                    "datasphere", "objects", "replication-flows", "create",
-                    "--space", self.source_space,
-                    "--technical-name", flow_name,
-                    "--file-path", str(flow_file),
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ])
-            time.sleep(3)
+            log("FLOW", f"[Phase 1] Creating '{flow_name}' (isNew=True, --no-deploy --save-anyway)...")
+            r1 = self._rf_cmd("create", flow_name, file_new, ["--no-deploy", "--save-anyway"])
+            if r1.returncode != 0:
+                err = (r1.stderr or r1.stdout).strip()
+                log("FLOW", f"[Phase 1] --no-deploy create failed ({err}). Trying plain create...", "WARN")
+                r1 = self._rf_cmd("create", flow_name, file_new)
+                if r1.returncode != 0:
+                    # May already exist despite check; fall through to update
+                    log("FLOW", f"[Phase 1] Plain create also failed. Trying update...", "WARN")
+                    r1 = self._rf_cmd("update", flow_name, file_new, ["--no-deploy", "--save-anyway"])
         else:
-            log("FLOW", f"Updating Replication Flow '{flow_name}' (Save 1/2 with --no-deploy)...")
-            run_cmd([
-                "datasphere", "objects", "replication-flows", "update",
-                "--space", self.source_space,
-                "--technical-name", flow_name,
-                "--file-path", str(flow_file),
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host,
-                "--no-deploy",
-                "--save-anyway"
-            ])
-            time.sleep(3)
+            log("FLOW", f"[Phase 1] Updating existing '{flow_name}' (isNew=True, --no-deploy --save-anyway)...")
+            r1 = self._rf_cmd("update", flow_name, file_new, ["--no-deploy", "--save-anyway"])
+            if r1.returncode != 0:
+                log("FLOW", f"[Phase 1] --no-deploy update failed. Trying plain update...", "WARN")
+                r1 = self._rf_cmd("update", flow_name, file_new)
 
-        # -----------------------------------------------------------------
-        # Phase 2: Save 2/2 once again before deploying
-        # As mandated by SAP Datasphere:
-        # "You need to save the replication flow once again before deploying it
-        # so that the new objects are included correctly."
-        # -----------------------------------------------------------------
-        log("FLOW", f"Saving Replication Flow '{flow_name}' once again before deploying (Save 2/2)...")
-        run_cmd([
-            "datasphere", "objects", "replication-flows", "update",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(flow_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host,
-            "--no-deploy",
-            "--save-anyway"
-        ])
-        time.sleep(3)
+        time.sleep(5)  # Allow Datasphere to register the new target object
 
-        # -----------------------------------------------------------------
-        # Phase 3: Deploy after the 2-phase save has finished!
-        # This commits target objects so they materialize active and dark.
-        # -----------------------------------------------------------------
-        log("FLOW", f"Deploying Replication Flow '{flow_name}' (materializing target objects dark/active)...")
-        deploy_cmd = [
-            "datasphere", "objects", "replication-flows", "update",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(flow_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host,
-            "--deploy-anyway"
-        ]
-        ures = run_cmd(deploy_cmd)
-        if ures.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully deployed (target objects materialized).")
+        # --- Phase 2: Save again with isNew=False (SAP-mandated second save before deploy) ---
+        log("FLOW", f"[Phase 2] Saving '{flow_name}' again (isNew=False, --no-deploy --save-anyway)...")
+        r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy", "--save-anyway"])
+        if r2.returncode != 0:
+            log("FLOW", f"[Phase 2] --no-deploy update failed. Trying plain update...", "WARN")
+            self._rf_cmd("update", flow_name, file_existing)
+        time.sleep(5)
+
+        # --- Phase 3: Deploy ---
+        log("FLOW", f"[Phase 3] Deploying '{flow_name}' (isNew=False, --deploy-anyway)...")
+        r3 = self._rf_cmd("update", flow_name, file_existing, ["--deploy-anyway"])
+        if r3.returncode == 0:
+            log("FLOW", f"[Phase 3] '{flow_name}' deployed successfully. Target objects are now active.")
             return True
 
-        # Fallback with standard update/deploy if --deploy-anyway is unsupported
-        log("FLOW", f"Deploy notice: {ures.stderr or ures.stdout}. Retrying standard update/deploy...", "WARN")
-        ures_std = run_cmd([
-            "datasphere", "objects", "replication-flows", "update",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(flow_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ])
-        if ures_std.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully deployed.")
+        log("FLOW", f"[Phase 3] --deploy-anyway failed ({(r3.stderr or r3.stdout).strip()}). Trying plain update...", "WARN")
+        r3b = self._rf_cmd("update", flow_name, file_existing)
+        if r3b.returncode == 0:
+            log("FLOW", f"[Phase 3] '{flow_name}' deployed via plain update.")
             return True
 
-        # Fallback with bare JSON format if wrapped format encounters issue
-        bare_file = Path(self.temp_dir.name) / f"{flow_name}_bare.json"
-        with open(bare_file, "w", encoding="utf-8") as f:
-            json.dump(bare_json, f, indent=2)
-
-        log("FLOW", "Attempting update with bare JSON schema format...", "WARN")
-        ures_bare = run_cmd([
-            "datasphere", "objects", "replication-flows", "update",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(bare_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host,
-            "--deploy-anyway"
-        ])
-        if ures_bare.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully deployed with bare schema.")
-            return True
-
-        log("FLOW", f"Failed to save/deploy Replication Flow '{flow_name}': {ures_bare.stderr or ures_bare.stdout}", "ERROR")
+        log("FLOW", f"Failed to deploy '{flow_name}': {(r3b.stderr or r3b.stdout).strip()}", "ERROR")
         return False
 
     def execute_flow(self, flow_name: str) -> bool:
         log("RUN", f"Triggering execution of Replication Flow '{flow_name}'...")
-        cmd = [
-            "datasphere", "tasks", "replication-flows", "run",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        res = run_cmd(cmd)
+        res = run_cmd(["datasphere", "tasks", "replication-flows", "run",
+                       "--space", self.source_space,
+                       "--technical-name", flow_name,
+                       "--secrets-file", str(self.secrets_path),
+                       "--host", self.host])
         if res.returncode != 0:
-            err = res.stderr or res.stdout
-            log("RUN", f"Failed to run Replication Flow '{flow_name}': {err}", "ERROR")
+            log("RUN", f"Failed to run '{flow_name}': {res.stderr or res.stdout}", "ERROR")
             return False
-
         log("RUN", f"Replication Flow '{flow_name}' run initiated.")
         return True
 
     def monitor_flow(self, flow_name: str) -> str:
-        log("MONITOR", f"Monitoring Replication Flow '{flow_name}' execution (Timeout: {self.timeout_sec}s)...")
+        log("MONITOR", f"Monitoring '{flow_name}' (Timeout: {self.timeout_sec}s)...")
         start_time = time.time()
         last_status = "UNKNOWN"
-
         while time.time() - start_time < self.timeout_sec:
-            cmd = [
-                "datasphere", "tasks", "replication-flows", "status",
-                "--space", self.source_space,
-                "--technical-name", flow_name,
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host
-            ]
-            res = run_cmd(cmd)
+            res = run_cmd(["datasphere", "tasks", "replication-flows", "status",
+                           "--space", self.source_space,
+                           "--technical-name", flow_name,
+                           "--secrets-file", str(self.secrets_path),
+                           "--host", self.host])
             status_text = (res.stdout or res.stderr).strip().upper()
-
-            if "COMPLETED" in status_text or "FINISHED" in status_text or "SUCCESS" in status_text:
+            if any(s in status_text for s in ("COMPLETED", "FINISHED", "SUCCESS")):
                 log("MONITOR", f"Flow '{flow_name}' completed successfully.")
                 return "COMPLETED"
-            elif "FAILED" in status_text or "ERROR" in status_text or "ABORTED" in status_text:
-                log("MONITOR", f"Flow '{flow_name}' execution failed: {status_text}", "ERROR")
+            elif any(s in status_text for s in ("FAILED", "ERROR", "ABORTED")):
+                log("MONITOR", f"Flow '{flow_name}' failed: {status_text}", "ERROR")
                 return "FAILED"
-            elif "RUNNING" in status_text or "ACTIVE" in status_text or "IN_PROGRESS" in status_text:
+            elif any(s in status_text for s in ("RUNNING", "ACTIVE", "IN_PROGRESS")):
                 last_status = "RUNNING"
-                log("MONITOR", f"Flow '{flow_name}' is currently running...")
+                log("MONITOR", f"Flow '{flow_name}' is running...")
             else:
                 last_status = status_text or "PENDING"
                 log("MONITOR", f"Flow '{flow_name}' status: {last_status}")
-
             time.sleep(self.poll_interval)
-
         log("MONITOR", f"Flow '{flow_name}' timed out after {self.timeout_sec}s.", "WARN")
         return f"TIMEOUT ({last_status})"
 
     def validate_local_table(self, table_name: str, view_name: str = "") -> tuple:
-        log("TABLE", f"Validating replicated Local Table '{table_name}' in space '{self.source_space}'...")
-
-        # 1. Discover existing tables via local-tables list (with retries to allow indexing)
+        log("TABLE", f"Validating Local Table '{table_name}' in space '{self.source_space}'...")
         tables_found = []
         actual_table_name = table_name
 
-        for attempt in range(1, 4):
-            list_cmd = [
-                "datasphere", "objects", "local-tables", "list",
-                "--space", self.source_space,
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host
-            ]
-            lres = run_cmd(list_cmd)
+        for attempt in range(1, 5):
+            lres = run_cmd(["datasphere", "objects", "local-tables", "list",
+                            "--space", self.source_space,
+                            "--secrets-file", str(self.secrets_path),
+                            "--host", self.host])
             tables_found = []
-
             if lres.returncode == 0 and lres.stdout:
                 try:
                     data = json.loads(lres.stdout.strip())
-                    if isinstance(data, list):
-                        tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in data]
-                    elif isinstance(data, dict):
-                        items = data.get("value", data.get("objects", []))
-                        tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in items]
+                    items = data if isinstance(data, list) else data.get("value", data.get("objects", []))
+                    tables_found = [item.get("technicalName", str(item)) if isinstance(item, dict) else str(item) for item in items]
                 except Exception:
                     for line in lres.stdout.splitlines():
                         parts = line.strip().split()
                         if parts and not parts[0].startswith("-") and parts[0].lower() not in ("technical", "name", "id"):
                             tables_found.append(parts[0])
 
-            # Match target table in listing (exact -> case-insensitive -> view-based)
             matched = None
             for t in tables_found:
-                if t == table_name:
+                if t == table_name or t.upper() == table_name.upper():
                     matched = t
                     break
-                elif t.upper() == table_name.upper():
+                elif view_name and (view_name.upper() in t.upper()):
                     matched = t
                     break
-                elif view_name and (view_name.upper() in t.upper() or t.upper() in f"{self.table_prefix}{view_name}".upper()):
-                    matched = t
-                    break
-
             if matched:
                 actual_table_name = matched
-                log("TABLE", f"Matched local table '{actual_table_name}' in space '{self.source_space}'.")
+                log("TABLE", f"Matched local table '{actual_table_name}'.")
                 break
             else:
-                log("TABLE", f"Attempt {attempt}/3: Local tables currently found in space '{self.source_space}': {tables_found}")
-                if attempt < 3:
-                    time.sleep(5)
+                log("TABLE", f"Attempt {attempt}/4: Tables found: {tables_found}")
+                if attempt < 4:
+                    time.sleep(10)
 
-        # 2. Read the local table definition
-        table_output = Path(self.temp_dir.name) / f"{actual_table_name}_def.json"
+        # Try to read the table definition
         table_def = {}
         read_success = False
+        table_output = Path(self.temp_dir.name) / f"{actual_table_name}_def.json"
 
-        # Attempt reading with various accept headers and output modes
-        read_attempts = [
-            # 1. Design-time header to file (standard for Delta Lake / Delta Capture tables)
-            (
-                [
-                    "datasphere", "objects", "local-tables", "read",
-                    "--space", self.source_space,
-                    "--technical-name", actual_table_name,
-                    "--accept", "application/vnd.sap.datasphere.object.content.design-time+json",
-                    "--output", str(table_output),
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ],
-                "file"
-            ),
-            # 2. Design-time header capturing stdout directly
-            (
-                [
-                    "datasphere", "objects", "local-tables", "read",
-                    "--space", self.source_space,
-                    "--technical-name", actual_table_name,
-                    "--accept", "application/vnd.sap.datasphere.object.content.design-time+json",
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ],
-                "stdout"
-            ),
-            # 3. Full object content to file
-            (
-                [
-                    "datasphere", "objects", "local-tables", "read",
-                    "--space", self.source_space,
-                    "--technical-name", actual_table_name,
-                    "--accept", "application/vnd.sap.datasphere.object.content+json",
-                    "--output", str(table_output),
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ],
-                "file"
-            ),
-            # 4. Standard read to file (no accept header)
-            (
-                [
-                    "datasphere", "objects", "local-tables", "read",
-                    "--space", self.source_space,
-                    "--technical-name", actual_table_name,
-                    "--output", str(table_output),
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ],
-                "file"
-            ),
-            # 5. Standard read stdout (no accept header)
-            (
-                [
-                    "datasphere", "objects", "local-tables", "read",
-                    "--space", self.source_space,
-                    "--technical-name", actual_table_name,
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ],
-                "stdout"
-            )
-        ]
-
-        for cmd, output_mode in read_attempts:
+        for extra_args in [
+            ["--accept", "application/vnd.sap.datasphere.object.content.design-time+json", "--output", str(table_output)],
+            ["--output", str(table_output)],
+            []
+        ]:
+            cmd = ["datasphere", "objects", "local-tables", "read",
+                   "--space", self.source_space,
+                   "--technical-name", actual_table_name,
+                   "--secrets-file", str(self.secrets_path),
+                   "--host", self.host] + extra_args
             rres = run_cmd(cmd)
             if rres.returncode == 0:
-                if output_mode == "file" and table_output.exists():
+                if "--output" in extra_args and table_output.exists():
                     try:
                         with open(table_output, "r", encoding="utf-8") as f:
                             table_def = json.load(f)
                         read_success = True
-                        log("TABLE", f"Local Table '{actual_table_name}' definition successfully loaded from file.")
                         break
-                    except Exception as e:
-                        log("TABLE", f"Read file parsing note ({e}), trying next option...", "WARN")
-                elif output_mode == "stdout" and rres.stdout:
+                    except Exception:
+                        pass
+                elif rres.stdout:
                     try:
                         raw = rres.stdout.strip()
-                        start_idx = raw.find("{")
-                        if start_idx != -1:
-                            table_def = json.loads(raw[start_idx:])
+                        idx = raw.find("{")
+                        if idx != -1:
+                            table_def = json.loads(raw[idx:])
                             read_success = True
-                            log("TABLE", f"Local Table '{actual_table_name}' definition successfully read from stdout.")
                             break
-                    except Exception as e:
-                        log("TABLE", f"Read stdout parsing note ({e}), trying next option...", "WARN")
+                    except Exception:
+                        pass
 
-        # 3. Determine validation result
-        table_in_space = actual_table_name in tables_found or any(t.upper() == actual_table_name.upper() for t in tables_found)
+        table_in_space = any(t.upper() == actual_table_name.upper() for t in tables_found)
         if read_success or table_in_space:
-            log("TABLE", f"Local Table '{actual_table_name}' validated successfully in space '{self.source_space}'.")
+            log("TABLE", f"Local Table '{actual_table_name}' validated successfully.")
             return True, table_def, actual_table_name
 
-        log("TABLE", f"Local Table '{actual_table_name}' could not be validated in space '{self.source_space}'.", "WARN")
+        log("TABLE", f"Local Table '{actual_table_name}' could not be validated.", "WARN")
         return False, {}, actual_table_name
 
     def share_local_table(self, table_name: str, table_def: dict, view_name: str = "") -> tuple:
         if not self.consumer_spaces:
-            log("SHARE", "No consumer spaces configured; skipping space sharing.")
+            log("SHARE", "No consumer spaces configured; skipping sharing.")
             return True, []
 
-        log("SHARE", f"Sharing Local Table '{table_name}' with consumer spaces: {', '.join(self.consumer_spaces)}...")
+        log("SHARE", f"Sharing '{table_name}' with: {', '.join(self.consumer_spaces)}...")
 
+        # Try sharing_only format first (most reliable), then full CSN if available
         payload_options = []
-        if table_def and isinstance(table_def, dict) and "definitions" in table_def:
-            full_def = dict(table_def)
-            if "sharing" not in full_def:
-                full_def["sharing"] = {}
-            full_def["sharing"][table_name] = {
-                "targetSpaces": self.consumer_spaces
-            }
-            payload_options.append(("full_csn", full_def))
 
-        sharing_only = {
-            "sharing": {
-                table_name: {
-                    "targetSpaces": self.consumer_spaces
-                }
-            }
-        }
+        sharing_only = {"sharing": {table_name: {"targetSpaces": self.consumer_spaces}}}
         payload_options.append(("sharing_only", sharing_only))
 
-        if not any(name == "full_csn" for name, _ in payload_options):
-            try:
-                source_cols, keys, target_cols, _, elements = self.get_cds_view_schema(view_name, table_name)
-                synth_def = {
-                    "definitions": {
-                        table_name: {
-                            "kind": "entity",
-                            "@EndUserText.label": table_name,
-                            "@ObjectModel.modelingPattern": {"#": "DATA_STRUCTURE"},
-                            "@DataWarehouse.persistence.hdlf.tableFormat": {"#": "DELTA_LAKE"},
-                            "elements": elements
-                        }
-                    },
-                    "sharing": {
-                        table_name: {
-                            "targetSpaces": self.consumer_spaces
-                        }
-                    }
-                }
-                payload_options.append(("synthesized_csn", synth_def))
-            except Exception as e:
-                log("SHARE", f"Synthesizing CSN note: {e}", "WARN")
+        if table_def and isinstance(table_def, dict) and "definitions" in table_def:
+            full_def = dict(table_def)
+            full_def.setdefault("sharing", {})[table_name] = {"targetSpaces": self.consumer_spaces}
+            payload_options.insert(0, ("full_csn", full_def))
 
-        shared_success = False
         last_err = ""
         for opt_name, payload in payload_options:
-            share_file = Path(self.temp_dir.name) / f"{table_name}_share_{opt_name}.json"
-            with open(share_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-
-            log("SHARE", f"Attempting update with {opt_name} format...")
-            update_cmd = [
-                "datasphere", "objects", "local-tables", "update",
-                "--space", self.source_space,
-                "--technical-name", table_name,
-                "--file-path", str(share_file),
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host
-            ]
-            res = run_cmd(update_cmd)
+            share_file = self._write_json(f"{table_name}_share_{opt_name}", payload)
+            log("SHARE", f"Attempting {opt_name} format...")
+            res = run_cmd(["datasphere", "objects", "local-tables", "update",
+                           "--space", self.source_space,
+                           "--technical-name", table_name,
+                           "--file-path", str(share_file),
+                           "--secrets-file", str(self.secrets_path),
+                           "--host", self.host])
             if res.returncode == 0:
-                log("SHARE", f"Sharing configuration successfully applied via {opt_name} format.")
-                shared_success = True
-                break
+                log("SHARE", f"Sharing applied via {opt_name}.")
+                return True, self.consumer_spaces
             else:
                 last_err = res.stderr or res.stdout
-                log("SHARE", f"{opt_name} update notice: {last_err}", "WARN")
+                log("SHARE", f"{opt_name} notice: {last_err}", "WARN")
 
-        if not shared_success:
-            log("SHARE", f"Failed to share Local Table '{table_name}': {last_err}", "ERROR")
-            return False, []
-
-        # Validate sharing
-        verify_file = Path(self.temp_dir.name) / f"{table_name}_verify.json"
-        vcmd = [
-            "datasphere", "objects", "local-tables", "read",
-            "--space", self.source_space,
-            "--technical-name", table_name,
-            "--accept", "application/vnd.sap.datasphere.object.content.design-time+json",
-            "--output", str(verify_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        vres = run_cmd(vcmd)
-        shared_confirmed = []
-        if vres.returncode == 0 and verify_file.exists():
-            try:
-                with open(verify_file, "r", encoding="utf-8") as vf:
-                    vdata = json.load(vf)
-                shared_confirmed = vdata.get("sharing", {}).get(table_name, {}).get("targetSpaces", [])
-            except Exception:
-                pass
-
-        if set(self.consumer_spaces).issubset(set(shared_confirmed)):
-            log("SHARE", f"Sharing verified for table '{table_name}' in spaces: {', '.join(shared_confirmed)}.")
-            return True, shared_confirmed
-        else:
-            log("SHARE", f"Sharing applied, confirmed spaces: {', '.join(shared_confirmed) or ', '.join(self.consumer_spaces)}.")
-            return True, shared_confirmed or self.consumer_spaces
+        log("SHARE", f"Failed to share '{table_name}': {last_err}", "ERROR")
+        return False, []
 
     def generate_report(self):
         log("REPORT", "Generating execution report...")
-        report_md_path = self.report_dir / "replication_report.md"
-        report_json_path = self.report_dir / "replication_report.json"
-
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         total_views = len(self.results)
         succeeded = sum(1 for r in self.results.values() if r.get("status") == "SUCCESS")
         failed = total_views - succeeded
 
-        # Markdown Report
         lines = [
             "# SAP Datasphere Replication Flow Execution Report",
             f"**Execution Timestamp:** {timestamp}  ",
@@ -1104,57 +651,45 @@ class ReplicationOrchestrator:
             f"**Consumer Spaces:** `{', '.join(self.consumer_spaces) if self.consumer_spaces else 'None'}`  ",
             f"**Overall Status:** {'✅ SUCCESS' if failed == 0 and total_views > 0 else '❌ ISSUES DETECTED'}",
             "",
-            f"**Summary:** Total CDS Views: `{total_views}` | Succeeded: `{succeeded}` | Failed: `{failed}`",
+            f"**Summary:** Total: `{total_views}` | Succeeded: `{succeeded}` | Failed: `{failed}`",
             "",
-            "| CDS View | Replication Flow | Execution Status | Local Table | Table Validated | Shared With Spaces | Details |",
+            "| CDS View | Replication Flow | Execution Status | Local Table | Table Validated | Shared With | Details |",
             "| :--- | :--- | :--- | :--- | :---: | :--- | :--- |"
         ]
 
         for view, item in self.results.items():
             flow_name = item.get("flow_name", "-")
             status = item.get("flow_status", "UNKNOWN")
-            status_icon = "✅" if status in ("COMPLETED", "SUCCESS") else ("⚠️" if "TIMEOUT" in status else "❌")
-            table_name = item.get("table_name", "-")
-            table_val = "✅" if item.get("table_validated") else "❌"
+            icon = "✅" if status in ("COMPLETED", "SUCCESS") else ("⚠️" if "TIMEOUT" in status else "❌")
+            tname = item.get("table_name", "-")
+            tval = "✅" if item.get("table_validated") else "❌"
             shared = ", ".join(item.get("shared_spaces", [])) or "None"
             details = item.get("details", "")
-            lines.append(f"| `{view}` | `{flow_name}` | {status_icon} {status} | `{table_name}` | {table_val} | {shared} | {details} |")
+            lines.append(f"| `{view}` | `{flow_name}` | {icon} {status} | `{tname}` | {tval} | {shared} | {details} |")
 
         report_md = "\n".join(lines)
+        report_md_path = self.report_dir / "replication_report.md"
+        report_json_path = self.report_dir / "replication_report.json"
+
         with open(report_md_path, "w", encoding="utf-8") as f:
             f.write(report_md)
-
-        # JSON Report
-        json_data = {
-            "timestamp": timestamp,
-            "source_space": self.source_space,
-            "source_connection": self.source_conn,
-            "consumer_spaces": self.consumer_spaces,
-            "summary": {
-                "total": total_views,
-                "succeeded": succeeded,
-                "failed": failed
-            },
-            "views": self.results
-        }
         with open(report_json_path, "w", encoding="utf-8") as f:
-            json.dump(json_data, f, indent=2)
+            json.dump({"timestamp": timestamp, "source_space": self.source_space,
+                       "summary": {"total": total_views, "succeeded": succeeded, "failed": failed},
+                       "views": self.results}, f, indent=2)
 
-        # Output to GitHub Step Summary if running in Actions
-        github_step_summary = os.getenv("GITHUB_STEP_SUMMARY")
-        if github_step_summary:
+        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+        if summary_path:
             try:
-                with open(github_step_summary, "a", encoding="utf-8") as sf:
+                with open(summary_path, "a", encoding="utf-8") as sf:
                     sf.write(report_md + "\n")
                 log("REPORT", "Appended report to GITHUB_STEP_SUMMARY.")
             except Exception as e:
                 log("REPORT", f"Failed to write GITHUB_STEP_SUMMARY: {e}", "WARN")
 
-        # Also print report to stdout
         print("\n" + "=" * 70)
         print(report_md)
         print("=" * 70 + "\n", flush=True)
-
         return failed == 0 and total_views > 0
 
     def run(self) -> bool:
@@ -1162,7 +697,7 @@ class ReplicationOrchestrator:
             self.validate_environment()
             all_views = self.read_cds_views()
             if not all_views:
-                log("RUN", "No CDS Views defined in cds_views.txt. Nothing to replicate.", "WARN")
+                log("RUN", "No CDS Views defined. Nothing to replicate.", "WARN")
                 return True
 
             views_to_process = self.detect_changes(all_views)
@@ -1188,56 +723,47 @@ class ReplicationOrchestrator:
                     "details": ""
                 }
 
-                # Step 1: Create or Update Replication Flow (Bundles flow & target entities in full CSN)
+                # Step 1: Create/Update & Deploy Replication Flow
                 created = self.create_or_update_flow(flow_name, view, table_name)
                 if not created:
-                    self.results[view]["flow_status"] = "CONFIG_FAILED"
-                    self.results[view]["status"] = "FAILED"
-                    self.results[view]["details"] = "Failed to create/update Replication Flow definition."
+                    self.results[view].update({"flow_status": "CONFIG_FAILED", "status": "FAILED",
+                                               "details": "Failed to create/deploy Replication Flow."})
                     continue
 
-                # Step 3: Run Flow
+                # Step 2: Run Flow
                 executed = self.execute_flow(flow_name)
                 if not executed:
-                    self.results[view]["flow_status"] = "EXECUTION_FAILED"
-                    self.results[view]["status"] = "FAILED"
-                    self.results[view]["details"] = "Triggering replication execution failed."
+                    self.results[view].update({"flow_status": "EXECUTION_FAILED", "status": "FAILED",
+                                               "details": "Triggering replication execution failed."})
                     continue
 
-                # Step 4: Monitor Flow
+                # Step 3: Monitor Flow
                 flow_status = self.monitor_flow(flow_name)
+                self.results[view]["flow_status"] = flow_status
                 if flow_status != "COMPLETED":
-                    self.results[view]["flow_status"] = flow_status
-                    self.results[view]["status"] = "FAILED"
-                    self.results[view]["details"] = f"Flow execution finished with status: {flow_status}"
+                    self.results[view].update({"status": "FAILED",
+                                               "details": f"Flow execution finished with status: {flow_status}"})
                     continue
 
-                self.results[view]["flow_status"] = flow_status
-
-                # Step 5: Validate Local Table
+                # Step 4: Validate Local Table
                 table_valid, table_def, actual_table_name = self.validate_local_table(table_name, view_name=view)
                 self.results[view]["table_name"] = actual_table_name
                 self.results[view]["table_validated"] = table_valid
                 if not table_valid:
-                    self.results[view]["status"] = "FAILED"
-                    self.results[view]["details"] = "Local Table validation failed."
+                    self.results[view].update({"status": "FAILED", "details": "Local Table validation failed."})
                     continue
 
-                # Step 6: Share Local Table with Consumer Spaces
+                # Step 5: Share Local Table
                 shared_ok, shared_spaces = self.share_local_table(actual_table_name, table_def, view_name=view)
                 self.results[view]["shared_spaces"] = shared_spaces
                 if not shared_ok:
-                    self.results[view]["status"] = "FAILED"
-                    self.results[view]["details"] = "Space sharing failed."
+                    self.results[view].update({"status": "FAILED", "details": "Space sharing failed."})
                     continue
 
-                # Mark success
-                self.results[view]["status"] = "SUCCESS"
-                self.results[view]["details"] = "Replication, table validation, and sharing completed successfully."
+                self.results[view].update({"status": "SUCCESS",
+                                           "details": "Replication, validation, and sharing completed successfully."})
 
-            success = self.generate_report()
-            return success
-
+            return self.generate_report()
         finally:
             self.cleanup()
 
@@ -1246,7 +772,6 @@ def main():
     parser = argparse.ArgumentParser(description="SAP Datasphere Replication Flows Orchestrator")
     parser.add_argument("--cds-file", default="cds_views.txt", help="Path to cds_views.txt")
     args = parser.parse_args()
-
     orchestrator = ReplicationOrchestrator(cds_file=args.cds_file)
     success = orchestrator.run()
     sys.exit(0 if success else 1)
