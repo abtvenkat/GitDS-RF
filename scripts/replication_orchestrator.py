@@ -568,73 +568,18 @@ class ReplicationOrchestrator:
 
     def create_or_update_flow(self, flow_name: str, view_name: str, table_name: str) -> bool:
         exists = self.check_flow_exists(flow_name)
-        action = "update" if exists else "create"
-        log("FLOW", f"{action.capitalize()}ing Replication Flow '{flow_name}' for CDS View '{view_name}'...")
+        log("FLOW", f"Flow '{flow_name}' existing in space: {exists}")
 
         wrapped_json, bare_json = self.build_flow_definition(flow_name, view_name, table_name)
 
-        # We test both payload formats:
-        # 1. Wrapped: {"replicationflows": {flow_name: flow_body}} (official output of 'read')
-        # 2. Bare: flow_body (direct object)
-        payloads = [
-            ("wrapped", wrapped_json),
-            ("bare", bare_json)
-        ]
+        # Use wrapped schema format (verified working with @sap/datasphere-cli)
+        flow_file = Path(self.temp_dir.name) / f"{flow_name}_wrapped.json"
+        with open(flow_file, "w", encoding="utf-8") as f:
+            json.dump(wrapped_json, f, indent=2)
 
-        err = ""
-        for payload_name, payload in payloads:
-            flow_file = Path(self.temp_dir.name) / f"{flow_name}_{payload_name}.json"
-            with open(flow_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-
-            log("FLOW", f"Attempting {action} with {payload_name} schema format (top keys: {list(payload.keys())})...")
-
-            # 1. Primary command
-            cmd = [
-                "datasphere", "objects", "replication-flows", action,
-                "--space", self.source_space,
-                "--technical-name", flow_name,
-                "--file-path", str(flow_file),
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host
-            ]
-            res = run_cmd(cmd)
-            if res.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed ({payload_name} format).")
-                return True
-
-            err = (res.stderr or res.stdout).strip()
-
-            # 2. Try with --deploy-anyway
-            res_deploy = run_cmd(cmd + ["--deploy-anyway"])
-            if res_deploy.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed with --deploy-anyway ({payload_name} format).")
-                return True
-
-            # 3. If create failed because already exists (409 Conflict), try update
-            if action == "create" and ("already exists" in err.lower() or "409" in err or "conflict" in err.lower()):
-                log("FLOW", f"Replication Flow '{flow_name}' already exists in tenant. Switching to update...")
-                update_cmd = [
-                    "datasphere", "objects", "replication-flows", "update",
-                    "--space", self.source_space,
-                    "--technical-name", flow_name,
-                    "--file-path", str(flow_file),
-                    "--secrets-file", str(self.secrets_path),
-                    "--host", self.host
-                ]
-                ures = run_cmd(update_cmd)
-                if ures.returncode == 0:
-                    log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed ({payload_name} format).")
-                    return True
-
-                ures_anyway = run_cmd(update_cmd + ["--deploy-anyway"])
-                if ures_anyway.returncode == 0:
-                    log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed with --deploy-anyway ({payload_name} format).")
-                    return True
-
-            # 4. If draft was in corrupted state, clean recreate
-            log("FLOW", f"Deployment did not succeed for {payload_name} format. Resetting draft flow '{flow_name}'...")
-            self.delete_flow_if_exists(flow_name)
+        # Step 1: Initial Create if flow does not exist
+        if not exists:
+            log("FLOW", f"Creating Replication Flow '{flow_name}' for CDS View '{view_name}' (Initial Save)...")
             create_cmd = [
                 "datasphere", "objects", "replication-flows", "create",
                 "--space", self.source_space,
@@ -644,28 +589,65 @@ class ReplicationOrchestrator:
                 "--host", self.host
             ]
             cres = run_cmd(create_cmd)
-            if cres.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully created and deployed after reset ({payload_name} format).")
-                return True
+            if cres.returncode != 0:
+                err = (cres.stderr or cres.stdout).strip()
+                if "already exists" in err.lower() or "409" in err or "conflict" in err.lower():
+                    log("FLOW", f"Replication Flow '{flow_name}' already exists in tenant. Proceeding to update.")
+                else:
+                    log("FLOW", f"Create notice: {err}. Attempting create with --deploy-anyway...", "WARN")
+                    cres_anyway = run_cmd(create_cmd + ["--deploy-anyway"])
+                    if cres_anyway.returncode != 0:
+                        log("FLOW", f"Clean recreate: resetting draft flow '{flow_name}'...")
+                        self.delete_flow_if_exists(flow_name)
+                        time.sleep(2)
+                        run_cmd(create_cmd)
 
-            cres_anyway = run_cmd(create_cmd + ["--deploy-anyway"])
-            if cres_anyway.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully created and deployed with --deploy-anyway after reset ({payload_name} format).")
-                return True
+            # Allow Datasphere repository to register initial creation
+            time.sleep(3)
 
-            # 5. Try without --technical-name
-            cres_noname = run_cmd([
-                "datasphere", "objects", "replication-flows", "create",
-                "--space", self.source_space,
-                "--file-path", str(flow_file),
-                "--secrets-file", str(self.secrets_path),
-                "--host", self.host
-            ])
-            if cres_noname.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully created without technical-name flag ({payload_name} format).")
-                return True
+        # Step 2: Update / Save Again to materialize target objects and deploy!
+        # As per SAP Datasphere requirement: "Now the objects are already created when the replication flow is saved.
+        # You need to save the replication flow once again before deploying it so that the new objects are included correctly."
+        log("FLOW", f"Updating / Saving Replication Flow '{flow_name}' once again to materialize target objects ({table_name}) and deploy...")
+        update_cmd = [
+            "datasphere", "objects", "replication-flows", "update",
+            "--space", self.source_space,
+            "--technical-name", flow_name,
+            "--file-path", str(flow_file),
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host
+        ]
+        ures = run_cmd(update_cmd)
+        if ures.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed (target objects materialized).")
+            return True
 
-        log("FLOW", f"Failed to deploy Replication Flow '{flow_name}' after trying all formats: {err}", "ERROR")
+        # Fallback with --deploy-anyway
+        log("FLOW", f"Update notice: {ures.stderr or ures.stdout}. Retrying update with --deploy-anyway...", "WARN")
+        ures_anyway = run_cmd(update_cmd + ["--deploy-anyway"])
+        if ures_anyway.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed with --deploy-anyway.")
+            return True
+
+        # Fallback with bare JSON format if wrapped had schema rejection
+        bare_file = Path(self.temp_dir.name) / f"{flow_name}_bare.json"
+        with open(bare_file, "w", encoding="utf-8") as f:
+            json.dump(bare_json, f, indent=2)
+
+        log("FLOW", "Attempting update with bare JSON schema format...", "WARN")
+        ures_bare = run_cmd([
+            "datasphere", "objects", "replication-flows", "update",
+            "--space", self.source_space,
+            "--technical-name", flow_name,
+            "--file-path", str(bare_file),
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host
+        ])
+        if ures_bare.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' successfully updated with bare schema.")
+            return True
+
+        log("FLOW", f"Failed to save/deploy Replication Flow '{flow_name}': {ures_bare.stderr or ures_bare.stdout}", "ERROR")
         return False
 
     def execute_flow(self, flow_name: str) -> bool:
