@@ -357,10 +357,10 @@ class ReplicationOrchestrator:
 
     def get_cds_view_schema(self, view_name: str, table_name: str) -> tuple:
         """
-        Returns (source_columns, keys, target_columns, entity_elements, target_dict_elems)
-        conforming to SAP S/4HANA CDS specifications and Datasphere CSN entity schemas.
-        NOTE: Non-key columns must NOT include "key": False — only key columns carry "key": True,
-        matching the exact SAP Datasphere export format verified against RF_SALES_TEST.
+        Returns (source_cols, keys, target_cols, target_dict_elems)
+        Strictly conforms to SAP Datasphere Replication Flow schema targeting DWC_HDLF (Delta Lake).
+        Target columns MUST include Change_Type ($DYNAMIC.string_1) and Change_Date (com.sap.core.timestamp)
+        which are required by Datasphere's Delta Lake / HDL_FILES engine.
         """
         v = view_name.upper()
         if v == "I_CURRENCY":
@@ -372,13 +372,6 @@ class ReplicationOrchestrator:
                 {"name": "AlternativeCurrencyKey", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "businessName": "Alternative Currency Key", "metadata": {}},
                 {"name": "IsPrimaryCurrencyForISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Primary Currency", "metadata": {}}
             ]
-            entity_elems = {
-                "Currency": {"type": "cds.String", "length": 5, "key": True, "notNull": True, "@EndUserText.label": "Currency"},
-                "Decimals": {"type": "cds.String", "length": 2, "@EndUserText.label": "Decimals"},
-                "CurrencyISOCode": {"type": "cds.String", "length": 3, "@EndUserText.label": "ISO Currency Code"},
-                "AlternativeCurrencyKey": {"type": "cds.String", "length": 3, "@EndUserText.label": "Alternative Currency Key"},
-                "IsPrimaryCurrencyForISOCode": {"type": "cds.String", "length": 1, "@EndUserText.label": "Primary Currency"}
-            }
         elif v == "I_CURRENCYTEXT":
             keys = ["Language", "Currency"]
             source_cols = [
@@ -387,57 +380,41 @@ class ReplicationOrchestrator:
                 {"name": "CurrencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Currency Name", "metadata": {}},
                 {"name": "CurrencyShortName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_15", "businessName": "Short text", "metadata": {}}
             ]
-            entity_elems = {
-                "Language": {"type": "cds.String", "length": 2, "key": True, "notNull": True, "@EndUserText.label": "Language Key"},
-                "Currency": {"type": "cds.String", "length": 5, "key": True, "notNull": True, "@EndUserText.label": "Currency"},
-                "CurrencyName": {"type": "cds.String", "length": 40, "@EndUserText.label": "Currency Name"},
-                "CurrencyShortName": {"type": "cds.String", "length": 15, "@EndUserText.label": "Short text"}
-            }
         else:
-            # Fallback for dynamic/arbitrary CDS view: provide basic string key + field
+            # Fallback for dynamic/arbitrary CDS view
             keys = [f"{view_name}_KEY"]
             source_cols = [
                 {"name": f"{view_name}_KEY", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50", "key": True, "businessName": f"{view_name} Key", "metadata": {}}
             ]
-            entity_elems = {
-                f"{view_name}_KEY": {"type": "cds.String", "length": 50, "key": True, "notNull": True, "@EndUserText.label": f"{view_name} Key"}
-            }
 
-        # Target columns mirror source columns exactly (same list)
-        target_cols = [dict(c) for c in source_cols]
-        # Target dict elems: each column name maps to empty dict (SAP Datasphere format)
-        target_dict_elems = {col["name"]: {} for col in source_cols}
-        return source_cols, keys, target_cols, entity_elems, target_dict_elems
+        # Target columns: business columns + Change_Type + Change_Date (required for Delta Lake / DWC_HDLF)
+        target_cols = [dict(c) for c in source_cols] + [
+            {"name": "Change_Type", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "metadata": {}},
+            {"name": "Change_Date", "vflow.type": "scalar", "vtype-ID": "com.sap.core.timestamp", "metadata": {}}
+        ]
 
-    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str) -> dict:
+        # Target dict elements for flow 'targets' map
+        target_dict_elems = {col["name"]: {} for col in target_cols}
+        return source_cols, keys, target_cols, target_dict_elems
+
+    def build_flow_definition(self, flow_name: str, view_name: str, table_name: str) -> tuple:
         """
-        Builds the SAP Datasphere Replication Flow JSON definition.
-        Strictly conforms to the official SAP Datasphere CSN export format verified against
-        a working exported Replication Flow (RF_SALES_TEST).
-
-        Key structural requirements:
-        - definitions: { <table_name>: entity def }  FIRST
-        - version, meta
-        - replicationflows: { <flow_name>: { kind, contents: {
-              sourceSystem, targetSystem,
-              vTypes: { scalar: { ... } },   <- REQUIRED - type registry for $DYNAMIC.X refs
-              replicationTasks: [...],
-              replicationTaskSetting, replicationFlowSetting, deltaLoadTrigger
-            },
-            sources: {},
-            targets: { <table>: { elements: { <col>: {} } } },
-            connections: { <conn>: {} }
-          }
-        }
-        - $version: "1.0"  LAST (as per SAP export format)
-
-        Always uses loadType INITIAL (Initial Only).
-        Always enables: Skip Unmapped Columns, Native Type content, Auto-merge.
+        Builds the SAP Datasphere Replication Flow definition.
+        Returns:
+            (wrapped_flow_json, bare_flow_json)
+        
+        Strictly conforms to official SAP Datasphere Replication Flow JSON specifications
+        verified against live flows (DATAVALIDATION and RF_SALES_TEST in RAD_S3X):
+        - loadType: INITIAL (strictly Initial Only)
+        - isDeltaDisabled: True
+        - Skip Unmapped Columns: hasSkipMappingCapability = True
+        - Content Type: ABAPcontentType = "Native Type", ABAPcontentTypeDisabled = False
+        - Auto-merge: isAutoMergeEnabledForTarget = True
+        - Target properties: com.sap.datasuite.tableCategory = DELTA, cdc mode & timestamp columns
+        - Root: strictly {"replicationflows": {flow_name: flow_body}} (NO definitions, version, meta, or $version)
         """
-        # Load type is always INITIAL for initial-only replication
         load_type_val = "INITIAL"
 
-        # Target connection resolution
         target_conn_id = self.target_conn if self.target_conn else "DWC_HDLF"
         if target_conn_id in ("DATASPHERE_LOCAL", ""):
             target_conn_id = "DWC_HDLF"
@@ -445,10 +422,10 @@ class ReplicationOrchestrator:
 
         source_container = f"/{self.source_container.lstrip('/')}"
 
-        source_cols, keys, target_cols, entity_elems, target_dict_elems = self.get_cds_view_schema(view_name, table_name)
+        source_cols, keys, target_cols, target_dict_elems = self.get_cds_view_schema(view_name, table_name)
 
-        # Build vTypes registry from all columns - REQUIRED by Datasphere CSN parser
-        all_cols = source_cols + [c for c in target_cols if c["name"] not in {s["name"] for s in source_cols}]
+        # Build vTypes registry from all columns with $DYNAMIC types
+        all_cols = source_cols + target_cols
         vtypes_scalar = self._build_vtypes(all_cols)
 
         flow_body = {
@@ -489,7 +466,6 @@ class ReplicationOrchestrator:
                         }
                     }
                 ],
-                # vTypes is REQUIRED: provides type definitions for $DYNAMIC.X vtype-IDs
                 "vTypes": {
                     "scalar": vtypes_scalar
                 },
@@ -507,8 +483,10 @@ class ReplicationOrchestrator:
                             },
                             "metadata": {
                                 "type": "tabular",
-                                # isDeltaDisabled=True ensures INITIAL-only mode is enforced
-                                "isDeltaDisabled": True
+                                "isDeltaDisabled": True,
+                                "invalidColumns": [
+                                    "/1DH/OPERATION"
+                                ]
                             },
                             "businessName": view_name
                         },
@@ -519,9 +497,14 @@ class ReplicationOrchestrator:
                                 "keys": keys
                             },
                             "metadata": {
-                                "isNew": True
+                                "isNew": False
                             },
-                            "businessName": table_name
+                            "properties": {
+                                "com.sap.datasuite.cdc.mode.column": "Change_Type",
+                                "com.sap.datasuite.cdc.timestamp.column": "Change_Date",
+                                "com.sap.datasuite.tableCategory": "DELTA"
+                            },
+                            "businessName": view_name
                         }
                     }
                 ],
@@ -546,40 +529,14 @@ class ReplicationOrchestrator:
             }
         }
 
-        definitions = {
-            table_name: {
-                "kind": "entity",
-                "@EndUserText.label": table_name,
-                "@ObjectModel.modelingPattern": {
-                    "#": "DATA_STRUCTURE"
-                },
-                "@ObjectModel.supportedCapabilities": [
-                    {
-                        "#": "DATA_STRUCTURE"
-                    }
-                ],
-                "@DataWarehouse.persistence.hdlf.tableFormat": {
-                    "#": "DELTA_LAKE"
-                },
-                "elements": entity_elems
+        # Format 1: Standard wrapped replication flow object (exact output of 'read')
+        wrapped = {
+            "replicationflows": {
+                flow_name: flow_body
             }
         }
 
-        # IMPORTANT: key order matches SAP Datasphere export format exactly:
-        # definitions -> version -> meta -> replicationflows -> $version (at end)
-        return {
-            "definitions": definitions,
-            "version": {
-                "csn": "1.0"
-            },
-            "meta": {
-                "creator": "CDS Compiler v1.19.2"
-            },
-            "replicationflows": {
-                flow_name: flow_body
-            },
-            "$version": "1.0"
-        }
+        return wrapped, flow_body
 
     def check_flow_exists(self, flow_name: str) -> bool:
         cmd = [
@@ -614,92 +571,101 @@ class ReplicationOrchestrator:
         action = "update" if exists else "create"
         log("FLOW", f"{action.capitalize()}ing Replication Flow '{flow_name}' for CDS View '{view_name}'...")
 
-        flow_json = self.build_flow_definition(flow_name, view_name, table_name)
-        flow_file = Path(self.temp_dir.name) / f"{flow_name}.json"
-        with open(flow_file, "w", encoding="utf-8") as f:
-            json.dump(flow_json, f, indent=2)
+        wrapped_json, bare_json = self.build_flow_definition(flow_name, view_name, table_name)
 
-        # Log the JSON structure (truncated) for debugging
-        log("FLOW", f"Flow JSON top-level keys: {list(flow_json.keys())}")
-
-        # 1. Execute primary action (create or update) via CLI
-        cmd = [
-            "datasphere", "objects", "replication-flows", action,
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(flow_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
+        # We test both payload formats:
+        # 1. Wrapped: {"replicationflows": {flow_name: flow_body}} (official output of 'read')
+        # 2. Bare: flow_body (direct object)
+        payloads = [
+            ("wrapped", wrapped_json),
+            ("bare", bare_json)
         ]
-        res = run_cmd(cmd)
-        if res.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed.")
-            return True
 
-        err = (res.stderr or res.stdout).strip()
-        log("FLOW", f"Primary {action} attempt failed: {err}", "WARN")
+        err = ""
+        for payload_name, payload in payloads:
+            flow_file = Path(self.temp_dir.name) / f"{flow_name}_{payload_name}.json"
+            with open(flow_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
 
-        # 2. If initial attempt failed, try with --deploy-anyway
-        deploy_anyway_cmd = cmd + ["--deploy-anyway"]
-        dres = run_cmd(deploy_anyway_cmd)
-        if dres.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed (with --deploy-anyway).")
-            return True
+            log("FLOW", f"Attempting {action} with {payload_name} schema format (top keys: {list(payload.keys())})...")
 
-        # 3. If create failed because object already exists (HTTP 409 Conflict), update it!
-        if action == "create" and ("already exists" in err.lower() or "409" in err or "conflict" in err.lower()):
-            log("FLOW", f"Replication Flow '{flow_name}' already exists. Updating and deploying it instead...")
-            update_cmd = [
-                "datasphere", "objects", "replication-flows", "update",
+            # 1. Primary command
+            cmd = [
+                "datasphere", "objects", "replication-flows", action,
                 "--space", self.source_space,
                 "--technical-name", flow_name,
                 "--file-path", str(flow_file),
                 "--secrets-file", str(self.secrets_path),
                 "--host", self.host
             ]
-            ures = run_cmd(update_cmd)
-            if ures.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed.")
+            res = run_cmd(cmd)
+            if res.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed ({payload_name} format).")
                 return True
-            
-            # Also try update with --deploy-anyway
-            ures_anyway = run_cmd(update_cmd + ["--deploy-anyway"])
-            if ures_anyway.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed (with --deploy-anyway).")
+
+            err = (res.stderr or res.stdout).strip()
+
+            # 2. Try with --deploy-anyway
+            res_deploy = run_cmd(cmd + ["--deploy-anyway"])
+            if res_deploy.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully {action}d and deployed with --deploy-anyway ({payload_name} format).")
                 return True
-            err = (ures.stderr or ures.stdout).strip()
 
-        # 4. Fallback: try deleting existing draft flow and recreating cleanly
-        log("FLOW", f"Deployment did not succeed directly. Attempting clean recreate of '{flow_name}'...")
-        self.delete_flow_if_exists(flow_name)
-        create_clean_cmd = [
-            "datasphere", "objects", "replication-flows", "create",
-            "--space", self.source_space,
-            "--technical-name", flow_name,
-            "--file-path", str(flow_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        clean_res = run_cmd(create_clean_cmd)
-        if clean_res.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully created and deployed after clean reset.")
-            return True
+            # 3. If create failed because already exists (409 Conflict), try update
+            if action == "create" and ("already exists" in err.lower() or "409" in err or "conflict" in err.lower()):
+                log("FLOW", f"Replication Flow '{flow_name}' already exists in tenant. Switching to update...")
+                update_cmd = [
+                    "datasphere", "objects", "replication-flows", "update",
+                    "--space", self.source_space,
+                    "--technical-name", flow_name,
+                    "--file-path", str(flow_file),
+                    "--secrets-file", str(self.secrets_path),
+                    "--host", self.host
+                ]
+                ures = run_cmd(update_cmd)
+                if ures.returncode == 0:
+                    log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed ({payload_name} format).")
+                    return True
 
-        # 5. Fallback: try CLI without --technical-name parameter (infers technical name from JSON)
-        fallback_action = "update" if ("already exists" in err.lower() or "409" in err) else action
-        no_name_cmd = [
-            "datasphere", "objects", "replication-flows", fallback_action,
-            "--space", self.source_space,
-            "--file-path", str(flow_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        res_no_name = run_cmd(no_name_cmd)
-        if res_no_name.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully processed ({fallback_action}d).")
-            return True
+                ures_anyway = run_cmd(update_cmd + ["--deploy-anyway"])
+                if ures_anyway.returncode == 0:
+                    log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed with --deploy-anyway ({payload_name} format).")
+                    return True
 
-        log("FLOW", f"Failed to deploy Replication Flow '{flow_name}': {err}", "ERROR")
+            # 4. If draft was in corrupted state, clean recreate
+            log("FLOW", f"Deployment did not succeed for {payload_name} format. Resetting draft flow '{flow_name}'...")
+            self.delete_flow_if_exists(flow_name)
+            create_cmd = [
+                "datasphere", "objects", "replication-flows", "create",
+                "--space", self.source_space,
+                "--technical-name", flow_name,
+                "--file-path", str(flow_file),
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host
+            ]
+            cres = run_cmd(create_cmd)
+            if cres.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully created and deployed after reset ({payload_name} format).")
+                return True
+
+            cres_anyway = run_cmd(create_cmd + ["--deploy-anyway"])
+            if cres_anyway.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully created and deployed with --deploy-anyway after reset ({payload_name} format).")
+                return True
+
+            # 5. Try without --technical-name
+            cres_noname = run_cmd([
+                "datasphere", "objects", "replication-flows", "create",
+                "--space", self.source_space,
+                "--file-path", str(flow_file),
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host
+            ])
+            if cres_noname.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' successfully created without technical-name flag ({payload_name} format).")
+                return True
+
+        log("FLOW", f"Failed to deploy Replication Flow '{flow_name}' after trying all formats: {err}", "ERROR")
         return False
 
     def execute_flow(self, flow_name: str) -> bool:
