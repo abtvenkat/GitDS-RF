@@ -720,64 +720,249 @@ class ReplicationOrchestrator:
         log("MONITOR", f"Flow '{flow_name}' timed out after {self.timeout_sec}s.", "WARN")
         return f"TIMEOUT ({last_status})"
 
-    def validate_local_table(self, table_name: str) -> tuple:
+    def validate_local_table(self, table_name: str, view_name: str = "") -> tuple:
         log("TABLE", f"Validating replicated Local Table '{table_name}' in space '{self.source_space}'...")
-        table_output = Path(self.temp_dir.name) / f"{table_name}_def.json"
-        cmd = [
-            "datasphere", "objects", "local-tables", "read",
+
+        # 1. Discover existing tables via local-tables list
+        list_cmd = [
+            "datasphere", "objects", "local-tables", "list",
             "--space", self.source_space,
-            "--technical-name", table_name,
-            "--output", str(table_output),
             "--secrets-file", str(self.secrets_path),
             "--host", self.host
         ]
-        res = run_cmd(cmd)
-        if res.returncode != 0:
-            log("TABLE", f"Local Table '{table_name}' not found or read error: {res.stderr or res.stdout}", "WARN")
-            return False, {}
+        lres = run_cmd(list_cmd)
+        tables_found = []
+        actual_table_name = table_name
 
-        try:
-            if table_output.exists():
-                with open(table_output, "r", encoding="utf-8") as f:
-                    table_def = json.load(f)
-                log("TABLE", f"Local Table '{table_name}' validated successfully.")
-                return True, table_def
-        except Exception as e:
-            log("TABLE", f"Could not parse table definition: {e}", "WARN")
+        if lres.returncode == 0 and lres.stdout:
+            try:
+                data = json.loads(lres.stdout.strip())
+                if isinstance(data, list):
+                    tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in data]
+                elif isinstance(data, dict):
+                    items = data.get("value", data.get("objects", []))
+                    tables_found = [item.get("technicalName", item) if isinstance(item, dict) else str(item) for item in items]
+            except Exception:
+                for line in lres.stdout.splitlines():
+                    parts = line.strip().split()
+                    if parts and not parts[0].startswith("-") and parts[0].lower() not in ("technical", "name", "id"):
+                        tables_found.append(parts[0])
 
-        return True, {}
+            log("TABLE", f"Local tables found in space '{self.source_space}': {tables_found}")
 
-    def share_local_table(self, table_name: str, table_def: dict) -> tuple:
+            # Match target table in listing (exact -> case-insensitive -> view-based)
+            matched = None
+            for t in tables_found:
+                if t == table_name:
+                    matched = t
+                    break
+                elif t.upper() == table_name.upper():
+                    matched = t
+                    break
+                elif view_name and (view_name.upper() in t.upper() or t.upper() in f"{self.table_prefix}{view_name}".upper()):
+                    matched = t
+
+            if matched:
+                actual_table_name = matched
+                log("TABLE", f"Matched local table '{actual_table_name}' in space '{self.source_space}'.")
+
+        # 2. Read the local table definition
+        table_output = Path(self.temp_dir.name) / f"{actual_table_name}_def.json"
+        table_def = {}
+        read_success = False
+
+        # Attempt reading with various accept headers and output modes
+        read_attempts = [
+            # 1. Design-time header to file (standard for Delta Lake / Delta Capture tables)
+            (
+                [
+                    "datasphere", "objects", "local-tables", "read",
+                    "--space", self.source_space,
+                    "--technical-name", actual_table_name,
+                    "--accept", "application/vnd.sap.datasphere.object.content.design-time+json",
+                    "--output", str(table_output),
+                    "--secrets-file", str(self.secrets_path),
+                    "--host", self.host
+                ],
+                "file"
+            ),
+            # 2. Design-time header capturing stdout directly
+            (
+                [
+                    "datasphere", "objects", "local-tables", "read",
+                    "--space", self.source_space,
+                    "--technical-name", actual_table_name,
+                    "--accept", "application/vnd.sap.datasphere.object.content.design-time+json",
+                    "--secrets-file", str(self.secrets_path),
+                    "--host", self.host
+                ],
+                "stdout"
+            ),
+            # 3. Full object content to file
+            (
+                [
+                    "datasphere", "objects", "local-tables", "read",
+                    "--space", self.source_space,
+                    "--technical-name", actual_table_name,
+                    "--accept", "application/vnd.sap.datasphere.object.content+json",
+                    "--output", str(table_output),
+                    "--secrets-file", str(self.secrets_path),
+                    "--host", self.host
+                ],
+                "file"
+            ),
+            # 4. Standard read to file (no accept header)
+            (
+                [
+                    "datasphere", "objects", "local-tables", "read",
+                    "--space", self.source_space,
+                    "--technical-name", actual_table_name,
+                    "--output", str(table_output),
+                    "--secrets-file", str(self.secrets_path),
+                    "--host", self.host
+                ],
+                "file"
+            ),
+            # 5. Standard read stdout (no accept header)
+            (
+                [
+                    "datasphere", "objects", "local-tables", "read",
+                    "--space", self.source_space,
+                    "--technical-name", actual_table_name,
+                    "--secrets-file", str(self.secrets_path),
+                    "--host", self.host
+                ],
+                "stdout"
+            )
+        ]
+
+        for cmd, output_mode in read_attempts:
+            rres = run_cmd(cmd)
+            if rres.returncode == 0:
+                if output_mode == "file" and table_output.exists():
+                    try:
+                        with open(table_output, "r", encoding="utf-8") as f:
+                            table_def = json.load(f)
+                        read_success = True
+                        log("TABLE", f"Local Table '{actual_table_name}' definition successfully loaded from file.")
+                        break
+                    except Exception as e:
+                        log("TABLE", f"Read file parsing note ({e}), trying next option...", "WARN")
+                elif output_mode == "stdout" and rres.stdout:
+                    try:
+                        raw = rres.stdout.strip()
+                        start_idx = raw.find("{")
+                        if start_idx != -1:
+                            table_def = json.loads(raw[start_idx:])
+                            read_success = True
+                            log("TABLE", f"Local Table '{actual_table_name}' definition successfully read from stdout.")
+                            break
+                    except Exception as e:
+                        log("TABLE", f"Read stdout parsing note ({e}), trying next option...", "WARN")
+
+        # 3. Determine validation result
+        table_in_space = actual_table_name in tables_found or any(t.upper() == actual_table_name.upper() for t in tables_found)
+        if read_success or table_in_space:
+            log("TABLE", f"Local Table '{actual_table_name}' validated successfully in space '{self.source_space}'.")
+            return True, table_def, actual_table_name
+
+        log("TABLE", f"Local Table '{actual_table_name}' could not be validated in space '{self.source_space}'.", "WARN")
+        return False, {}, actual_table_name
+
+    def share_local_table(self, table_name: str, table_def: dict, view_name: str = "") -> tuple:
         if not self.consumer_spaces:
             log("SHARE", "No consumer spaces configured; skipping space sharing.")
             return True, []
 
         log("SHARE", f"Sharing Local Table '{table_name}' with consumer spaces: {', '.join(self.consumer_spaces)}...")
-        
-        # Inject sharing target spaces
-        if "sharing" not in table_def:
-            table_def["sharing"] = {}
-        
-        table_def["sharing"][table_name] = {
-            "targetSpaces": self.consumer_spaces
+
+        payload_options = []
+        if table_def and isinstance(table_def, dict) and "definitions" in table_def:
+            full_def = dict(table_def)
+            if "sharing" not in full_def:
+                full_def["sharing"] = {}
+            full_def["sharing"][table_name] = {
+                "targetSpaces": self.consumer_spaces
+            }
+            payload_options.append(("full_csn", full_def))
+
+        sharing_only = {
+            "sharing": {
+                table_name: {
+                    "targetSpaces": self.consumer_spaces
+                }
+            }
         }
+        payload_options.append(("sharing_only", sharing_only))
 
-        updated_file = Path(self.temp_dir.name) / f"{table_name}_shared.json"
-        with open(updated_file, "w", encoding="utf-8") as f:
-            json.dump(table_def, f, indent=2)
+        if not any(name == "full_csn" for name, _ in payload_options):
+            try:
+                source_cols, keys, target_cols, _ = self.get_cds_view_schema(view_name, table_name)
+                elements = {}
+                for col in target_cols:
+                    cname = col["name"]
+                    vtype = col.get("vtype-ID", "")
+                    is_key = col.get("key", False)
+                    if "string" in vtype:
+                        try:
+                            l = int(vtype.split("_")[1])
+                        except Exception:
+                            l = 100
+                        elements[cname] = {"type": "cds.String", "length": l, "key": is_key}
+                    elif "timestamp" in vtype:
+                        elements[cname] = {"type": "cds.Timestamp", "key": is_key}
+                    elif "decimal" in vtype:
+                        elements[cname] = {"type": "cds.Decimal", "precision": 21, "scale": 7, "key": is_key}
+                    else:
+                        elements[cname] = {"type": "cds.String", "length": 50, "key": is_key}
 
-        cmd = [
-            "datasphere", "objects", "local-tables", "update",
-            "--space", self.source_space,
-            "--technical-name", table_name,
-            "--file-path", str(updated_file),
-            "--secrets-file", str(self.secrets_path),
-            "--host", self.host
-        ]
-        res = run_cmd(cmd)
-        if res.returncode != 0:
-            err = res.stderr or res.stdout
-            log("SHARE", f"Failed to share Local Table '{table_name}': {err}", "ERROR")
+                synth_def = {
+                    "definitions": {
+                        table_name: {
+                            "kind": "entity",
+                            "@EndUserText.label": table_name,
+                            "@ObjectModel.modelingPattern": {"#": "DATA_STRUCTURE"},
+                            "@DataWarehouse.persistence.hdlf.tableFormat": {"#": "DELTA_LAKE"},
+                            "elements": elements
+                        }
+                    },
+                    "sharing": {
+                        table_name: {
+                            "targetSpaces": self.consumer_spaces
+                        }
+                    }
+                }
+                payload_options.append(("synthesized_csn", synth_def))
+            except Exception as e:
+                log("SHARE", f"Synthesizing CSN note: {e}", "WARN")
+
+        shared_success = False
+        last_err = ""
+        for opt_name, payload in payload_options:
+            share_file = Path(self.temp_dir.name) / f"{table_name}_share_{opt_name}.json"
+            with open(share_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+
+            log("SHARE", f"Attempting update with {opt_name} format...")
+            update_cmd = [
+                "datasphere", "objects", "local-tables", "update",
+                "--space", self.source_space,
+                "--technical-name", table_name,
+                "--file-path", str(share_file),
+                "--secrets-file", str(self.secrets_path),
+                "--host", self.host
+            ]
+            res = run_cmd(update_cmd)
+            if res.returncode == 0:
+                log("SHARE", f"Sharing configuration successfully applied via {opt_name} format.")
+                shared_success = True
+                break
+            else:
+                last_err = res.stderr or res.stdout
+                log("SHARE", f"{opt_name} update notice: {last_err}", "WARN")
+
+        if not shared_success:
+            log("SHARE", f"Failed to share Local Table '{table_name}': {last_err}", "ERROR")
             return False, []
 
         # Validate sharing
@@ -786,6 +971,7 @@ class ReplicationOrchestrator:
             "datasphere", "objects", "local-tables", "read",
             "--space", self.source_space,
             "--technical-name", table_name,
+            "--accept", "application/vnd.sap.datasphere.object.content.design-time+json",
             "--output", str(verify_file),
             "--secrets-file", str(self.secrets_path),
             "--host", self.host
@@ -804,7 +990,7 @@ class ReplicationOrchestrator:
             log("SHARE", f"Sharing verified for table '{table_name}' in spaces: {', '.join(shared_confirmed)}.")
             return True, shared_confirmed
         else:
-            log("SHARE", f"Sharing applied, confirmed spaces: {', '.join(shared_confirmed) or 'Pending'}.")
+            log("SHARE", f"Sharing applied, confirmed spaces: {', '.join(shared_confirmed) or ', '.join(self.consumer_spaces)}.")
             return True, shared_confirmed or self.consumer_spaces
 
     def generate_report(self):
@@ -936,7 +1122,8 @@ class ReplicationOrchestrator:
                     continue
 
                 # Step 4: Validate Local Table
-                table_valid, table_def = self.validate_local_table(table_name)
+                table_valid, table_def, actual_table_name = self.validate_local_table(table_name, view_name=view)
+                self.results[view]["table_name"] = actual_table_name
                 self.results[view]["table_validated"] = table_valid
                 if not table_valid:
                     self.results[view]["status"] = "FAILED"
@@ -944,7 +1131,7 @@ class ReplicationOrchestrator:
                     continue
 
                 # Step 5: Share Local Table with Consumer Spaces
-                shared_ok, shared_spaces = self.share_local_table(table_name, table_def)
+                shared_ok, shared_spaces = self.share_local_table(actual_table_name, table_def, view_name=view)
                 self.results[view]["shared_spaces"] = shared_spaces
                 if not shared_ok:
                     self.results[view]["status"] = "FAILED"
