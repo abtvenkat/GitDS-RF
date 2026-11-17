@@ -5,9 +5,10 @@ SAP Datasphere Replication Flows Orchestrator
 Automates the lifecycle of SAP Datasphere Replication Flows on GitHub Actions runners:
 1. Parse CDS View names from cds_views.txt.
 2. If multiple CDS Views are provided, consolidates them into ONE single Replication Flow.
-3. Creates/saves the Replication Flow in SAP Datasphere via @sap/datasphere-cli.
-4. Attempts execution of the Replication Flow and monitors if deployed.
-5. Generates summary markdown and JSON reports.
+3. Performs a two-stage save to materialize and integrate target objects.
+4. Deploys the Replication Flow in SAP Datasphere via @sap/datasphere-cli.
+5. Executes the Replication Flow and monitors execution to completion.
+6. Generates comprehensive markdown and JSON reports.
 """
 
 import os
@@ -66,9 +67,6 @@ class ReplicationOrchestrator:
         self.flow_prefix = os.getenv("FLOW_PREFIX", "RF_").strip()
         self.table_prefix = os.getenv("TABLE_PREFIX", "LT_").strip()
         self.custom_flow_name = os.getenv("FLOW_NAME", "").strip() or os.getenv("REPLICATION_FLOW_NAME", "").strip()
-
-        consumer_spaces_env = os.getenv("CONSUMER_SPACES", "").strip()
-        self.consumer_spaces = [s.strip() for s in consumer_spaces_env.split(",") if s.strip()] if consumer_spaces_env else []
 
         self.poll_interval = int(os.getenv("STATUS_POLL_INTERVAL_SEC", "15"))
         self.timeout_sec = int(os.getenv("STATUS_TIMEOUT_SEC", "600"))
@@ -277,11 +275,33 @@ class ReplicationOrchestrator:
                 {"name": "CurrencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Currency Name", "metadata": {}},
                 {"name": "CurrencyShortName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_15", "businessName": "Short text", "metadata": {}}
             ]
-        else:
-            keys = [f"{view_name}_KEY"]
+        elif v in ("I_BILLINGFREQUENCY", "BILLINGFREQUENCY"):
+            keys = ["BillingFrequency"]
             source_cols = [
-                {"name": f"{view_name}_KEY", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50",
-                 "key": True, "businessName": f"{view_name} Key", "metadata": {}}
+                {"name": "BillingFrequency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "key": True, "businessName": "Billing Frequency", "metadata": {}}
+            ]
+        elif v in ("I_BILLINGFREQUENCY_TEXT", "I_BILLINGFREQUENCYTEXT", "BILLINGFREQUENCY_TEXT", "BILLINGFREQUENCYTEXT"):
+            keys = ["Language", "BillingFrequency"]
+            source_cols = [
+                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key", "metadata": {}},
+                {"name": "BillingFrequency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "key": True, "businessName": "Billing Frequency", "metadata": {}},
+                {"name": "BillingFrequencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Billing Frequency Name", "metadata": {}}
+            ]
+        elif v.endswith("_TEXT") or v.endswith("TEXT"):
+            base_name = v[:-5] if v.endswith("_TEXT") else v[:-4]
+            entity_name = base_name[2:] if base_name.startswith("I_") or base_name.startswith("C_") else base_name
+            keys = ["Language", entity_name]
+            source_cols = [
+                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key", "metadata": {}},
+                {"name": entity_name, "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50", "key": True, "businessName": entity_name, "metadata": {}},
+                {"name": f"{entity_name}Name", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": f"{entity_name} Name", "metadata": {}}
+            ]
+        else:
+            entity_name = v[2:] if v.startswith("I_") or v.startswith("C_") else v
+            keys = [entity_name]
+            source_cols = [
+                {"name": entity_name, "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50",
+                 "key": True, "businessName": entity_name, "metadata": {}}
             ]
 
         target_cols = [dict(c) for c in source_cols] + [
@@ -291,9 +311,11 @@ class ReplicationOrchestrator:
         target_dict_elems = {col["name"]: {} for col in target_cols}
         return source_cols, keys, target_cols, target_dict_elems
 
-    def build_consolidated_flow_json(self, flow_name: str, views: list) -> dict:
+    def build_consolidated_flow_json(self, flow_name: str, views: list, is_new: bool = True) -> dict:
         """
         Builds a SINGLE Replication Flow JSON containing all CDS Views as separate replication tasks.
+        When is_new=True, target objects are flagged for initial creation.
+        When is_new=False, target objects are flagged as materialized for deployment.
         """
         target_conn_id = self.target_conn if self.target_conn not in ("DATASPHERE_LOCAL", "", None) else "DWC_HDLF"
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
@@ -312,7 +334,7 @@ class ReplicationOrchestrator:
             task_name = f"replicationtask{idx}"
             task_def = {
                 "name": task_name,
-                "loadType": "INITIAL",
+                "loadType": self.load_type,
                 "priority": 50,
                 "truncate": False,
                 "sourceObject": {
@@ -324,7 +346,7 @@ class ReplicationOrchestrator:
                 "targetObject": {
                     "name": table_name,
                     "definition": {"columns": target_cols, "keys": keys},
-                    "metadata": {"isNew": True},
+                    "metadata": {"isNew": is_new},
                     "properties": {
                         "com.sap.datasuite.cdc.mode.column": "Change_Type",
                         "com.sap.datasuite.cdc.timestamp.column": "Change_Date",
@@ -412,39 +434,78 @@ class ReplicationOrchestrator:
 
     def create_or_update_flow(self, flow_name: str, views: list) -> bool:
         """
-        Creates or updates a single consolidated Replication Flow for all views (Save only, no auto-deployment).
-        Manual save & deploy can be performed in the Datasphere UI.
+        Creates, materializes target objects via two-stage save, and DEPLOYS the single
+        consolidated Replication Flow.
         """
         exists = self.check_flow_exists(flow_name)
         log("FLOW", f"Replication Flow '{flow_name}' existing in space '{self.source_space}': {exists}")
 
-        flow_payload = self.build_consolidated_flow_json(flow_name, views)
-        flow_file = self._write_json(f"{flow_name}_consolidated", flow_payload)
+        payload_new = self.build_consolidated_flow_json(flow_name, views, is_new=True)
+        file_new = self._write_json(f"{flow_name}_stage1", payload_new)
 
+        payload_existing = self.build_consolidated_flow_json(flow_name, views, is_new=False)
+        file_existing = self._write_json(f"{flow_name}_stage2", payload_existing)
+
+        # -------------------------------------------------------------
+        # STAGE 1: Save draft with --no-deploy to register target objects
+        # -------------------------------------------------------------
         action = "update" if exists else "create"
-        log("FLOW", f"{'Updating' if exists else 'Creating'} single Replication Flow '{flow_name}' for {len(views)} views ({', '.join(views)}) (Save only: --no-deploy)...")
-        r = self._rf_cmd(action, flow_name, flow_file, ["--no-deploy"])
-        if r.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' successfully saved in space '{self.source_space}'.")
-            return True
+        log("FLOW", f"Stage 1/3: {'Updating' if exists else 'Creating'} draft flow '{flow_name}' for {len(views)} views (--no-deploy)...")
+        r1 = self._rf_cmd(action, flow_name, file_new, ["--no-deploy"])
+        if r1.returncode != 0 and not exists:
+            log("FLOW", f"Create notice ({r1.stderr or r1.stdout}). Retrying with update...", "WARN")
+            r1 = self._rf_cmd("update", flow_name, file_new, ["--no-deploy"])
 
-        if not exists:
-            log("FLOW", f"Create notice: {r.stderr or r.stdout}. Attempting update...", "WARN")
-            r_upd = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy"])
-            if r_upd.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' updated successfully in space '{self.source_space}'.")
-                return True
-            err = r_upd.stderr or r_upd.stdout
+        if r1.returncode != 0:
+            log("FLOW", f"Stage 1 draft save notice ({r1.stderr or r1.stdout}). Retrying with --save-anyway...", "WARN")
+            r1 = self._rf_cmd("update", flow_name, file_new, ["--no-deploy", "--save-anyway"])
+            if r1.returncode != 0:
+                log("FLOW", f"Failed Stage 1 save for flow '{flow_name}': {r1.stderr or r1.stdout}", "ERROR")
+                return False
+
+        log("FLOW", f"Stage 1/3: Draft flow '{flow_name}' saved successfully.")
+        time.sleep(5)
+
+        # -------------------------------------------------------------
+        # STAGE 2: Re-save draft with isNew=False to materialize target objects
+        # -------------------------------------------------------------
+        log("FLOW", f"Stage 2/3: Re-saving flow '{flow_name}' to materialize target objects (--no-deploy)...")
+        r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy"])
+        if r2.returncode != 0:
+            log("FLOW", f"Stage 2 notice: {r2.stderr or r2.stdout}. Retrying with --save-anyway...", "WARN")
+            r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy", "--save-anyway"])
+            if r2.returncode != 0:
+                log("FLOW", f"Stage 2 warning: {r2.stderr or r2.stdout}. Proceeding to deployment...", "WARN")
         else:
-            err = r.stderr or r.stdout
+            log("FLOW", f"Stage 2/3: Flow '{flow_name}' target objects materialized.")
+        time.sleep(5)
 
-        log("FLOW", f"Save notice for Replication Flow '{flow_name}': {err}. Retrying with --save-anyway...", "WARN")
-        r_save = self._rf_cmd("update", flow_name, flow_file, ["--save-anyway"])
-        if r_save.returncode == 0:
-            log("FLOW", f"Replication Flow '{flow_name}' saved with --save-anyway.")
+        # -------------------------------------------------------------
+        # STAGE 3: DEPLOY the Replication Flow
+        # -------------------------------------------------------------
+        log("FLOW", f"Stage 3/3: Deploying Replication Flow '{flow_name}'...")
+        r_deploy = self._rf_cmd("update", flow_name, file_existing, [])
+        if r_deploy.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' deployed successfully!")
+            time.sleep(5)
             return True
 
-        log("FLOW", f"Failed to save Replication Flow '{flow_name}': {r_save.stderr or r_save.stdout}", "ERROR")
+        err = r_deploy.stderr or r_deploy.stdout
+        log("FLOW", f"Standard deploy notice: {err}. Retrying deploy with --deploy-anyway...", "WARN")
+        r_deploy2 = self._rf_cmd("update", flow_name, file_existing, ["--deploy-anyway"])
+        if r_deploy2.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' deployed successfully with --deploy-anyway!")
+            time.sleep(5)
+            return True
+
+        log("FLOW", f"Deploy with --deploy-anyway notice: {r_deploy2.stderr or r_deploy2.stdout}. Retrying deploy with --save-anyway...", "WARN")
+        r_deploy3 = self._rf_cmd("update", flow_name, file_existing, ["--save-anyway"])
+        if r_deploy3.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' deployed successfully with --save-anyway!")
+            time.sleep(5)
+            return True
+
+        log("FLOW", f"Deployment returned: {r_deploy3.stderr or r_deploy3.stdout}. Attempting execution check...", "WARN")
         return False
 
     def execute_flow(self, flow_name: str) -> bool:
@@ -456,8 +517,7 @@ class ReplicationOrchestrator:
                        "--host", self.host])
         if res.returncode != 0:
             err = (res.stderr or res.stdout).strip()
-            log("RUN", f"Flow run notice: {err}", "WARN")
-            log("RUN", "Replication Flow is saved in Datasphere. If manual deployment is needed, please Save and Deploy in the UI before execution.", "INFO")
+            log("RUN", f"Flow run notice: {err}", "ERROR")
             return False
         log("RUN", f"Replication Flow '{flow_name}' run successfully initiated.")
         return True
@@ -473,13 +533,13 @@ class ReplicationOrchestrator:
                            "--secrets-file", str(self.secrets_path),
                            "--host", self.host])
             status_text = (res.stdout or res.stderr).strip().upper()
-            if any(s in status_text for s in ("COMPLETED", "FINISHED", "SUCCESS")):
+            if any(s in status_text for s in ("COMPLETED", "FINISHED", "SUCCESS", "SUCCEEDED")):
                 log("MONITOR", f"Flow '{flow_name}' completed successfully.")
                 return "COMPLETED"
             elif any(s in status_text for s in ("FAILED", "ERROR", "ABORTED")):
                 log("MONITOR", f"Flow '{flow_name}' failed: {status_text}", "ERROR")
                 return "FAILED"
-            elif any(s in status_text for s in ("RUNNING", "ACTIVE", "IN_PROGRESS")):
+            elif any(s in status_text for s in ("RUNNING", "ACTIVE", "IN_PROGRESS", "INITIAL_LOAD", "REPLICATING", "STARTED")):
                 last_status = "RUNNING"
                 log("MONITOR", f"Flow '{flow_name}' is running...")
             else:
@@ -492,8 +552,7 @@ class ReplicationOrchestrator:
     def generate_report(self, views: list, flow_status: str) -> bool:
         log("REPORT", "Generating execution report...")
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        total_views = len(views)
-        is_success = flow_status in ("COMPLETED", "SUCCESS", "SAVED_AWAITING_DEPLOYMENT")
+        is_success = flow_status in ("COMPLETED", "SUCCESS")
 
         lines = [
             "# SAP Datasphere Replication Flow Execution Report",
@@ -503,7 +562,7 @@ class ReplicationOrchestrator:
             f"**Source Connection:** `{self.source_conn}`  ",
             f"**Status:** `{flow_status}`  ",
             "",
-            "| CDS View | Replication Flow | Target Local Table | Load Type | Status |",
+            "| CDS View | Replication Flow | Target Object | Load Type | Status |",
             "| :--- | :--- | :--- | :--- | :--- |"
         ]
 
@@ -553,7 +612,6 @@ class ReplicationOrchestrator:
                 log("RUN", "No changes detected. Nothing to process.")
                 return True
 
-            # Determine the single Replication Flow name
             if self.custom_flow_name:
                 self.flow_name = self.custom_flow_name
             elif len(views_to_process) == 1:
@@ -566,20 +624,20 @@ class ReplicationOrchestrator:
             self.authenticate_datasphere()
             self.validate_connection()
 
-            # Step 1: Create or Update the single Replication Flow
-            saved = self.create_or_update_flow(self.flow_name, views_to_process)
-            if not saved:
-                log("PROCESS", f"Failed to save Replication Flow '{self.flow_name}'.", "ERROR")
-                return self.generate_report(views_to_process, "SAVE_FAILED")
+            # Step 1: Create, materialize target objects, and Deploy the single Replication Flow
+            deployed = self.create_or_update_flow(self.flow_name, views_to_process)
+            if not deployed:
+                log("PROCESS", f"Deployment reported notices; verifying if Replication Flow '{self.flow_name}' is runnable...", "WARN")
 
-            # Step 2: Attempt running the Replication Flow
+            # Step 2: Trigger Replication Flow execution
             executed = self.execute_flow(self.flow_name)
             if not executed:
-                log("RUN", f"Replication Flow '{self.flow_name}' is saved in space '{self.source_space}'. As requested, manual Save & Deploy can be performed in the Datasphere UI.", "INFO")
-                return self.generate_report(views_to_process, "SAVED_AWAITING_DEPLOYMENT")
+                log("RUN", f"Failed to run Replication Flow '{self.flow_name}'.", "ERROR")
+                return self.generate_report(views_to_process, "EXECUTION_FAILED" if deployed else "DEPLOYMENT_FAILED")
 
-            # Step 3: Monitor Flow execution if successfully started
+            # Step 3: Monitor Flow execution to completion
             flow_status = self.monitor_flow(self.flow_name)
+
             return self.generate_report(views_to_process, flow_status)
 
         finally:

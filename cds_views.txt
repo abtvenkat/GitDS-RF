@@ -2,7 +2,3 @@
 # -----------------------------------------------------
 # Enter one CDS View technical name per line.
 # Blank lines and lines starting with '#' are ignored.
-
-I_BILLINGFREQUENCY
-I_BILLINGFREQUENCY_TEXT
-I_CURRENCYTEXT
