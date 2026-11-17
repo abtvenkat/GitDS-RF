@@ -62,6 +62,7 @@ jobs:
           LOAD_TYPE: ${{ vars.LOAD_TYPE || secrets.LOAD_TYPE || 'INITIAL' }}
           FLOW_PREFIX: ${{ vars.FLOW_PREFIX || 'RF_' }}
           TABLE_PREFIX: ${{ vars.TABLE_PREFIX || 'LT_' }}
+          FLOW_NAME: ${{ vars.FLOW_NAME || '' }}
           FORCE_REPLICATE_ALL: ${{ github.event.inputs.force_all || 'false' }}
           STATUS_TIMEOUT_SEC: ${{ vars.STATUS_TIMEOUT_SEC || '600' }}
           STATUS_POLL_INTERVAL_SEC: ${{ vars.STATUS_POLL_INTERVAL_SEC || '15' }}
