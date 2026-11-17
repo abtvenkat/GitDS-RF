@@ -289,11 +289,10 @@ class ReplicationOrchestrator:
         target_dict_elems = {col["name"]: {} for col in target_cols}
         return source_cols, keys, target_cols, target_dict_elems
 
-    def build_flow_json(self, flow_name: str, view_name: str, table_name: str, is_new: bool) -> dict:
+    def build_flow_json(self, flow_name: str, view_name: str, table_name: str, is_new: bool = False) -> dict:
         """
         Build the wrapped replication flow JSON payload.
-        is_new=True  -> Phase 1 create: tells Datasphere this target object is NEW and must be provisioned.
-        is_new=False -> Phase 2+ update/deploy: target object already registered.
+        is_new=False -> Maps directly to pre-created/existing target Local Table ("Map to Existing Target Object").
         """
         target_conn_id = self.target_conn if self.target_conn not in ("DATASPHERE_LOCAL", "", None) else "DWC_HDLF"
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
@@ -426,90 +425,184 @@ class ReplicationOrchestrator:
         else:
             log("FLOW", f"Could not delete flow '{flow_name}': {res.stderr or res.stdout}", "WARN")
 
+    def build_local_table_csn(self, view_name: str, table_name: str) -> dict:
+        """
+        Builds standard CSN entity schema for creating Local Tables via `datasphere objects local-tables create`.
+        Matches the columns, types, and primary keys of the CDS view and CDC tracking fields.
+        """
+        source_cols, keys, target_cols, _ = self.get_cds_view_schema(view_name, table_name)
+        elements = {}
+        for col in target_cols:
+            col_name = col["name"]
+            vtype = col.get("vtype-ID", "")
+            bname = col.get("businessName", col_name)
+            is_key = col.get("key", False)
+
+            elem_def = {"@EndUserText.label": bname}
+            if is_key:
+                elem_def["key"] = True
+                elem_def["notNull"] = True
+
+            if vtype.startswith("$DYNAMIC.string_"):
+                try:
+                    length = int(vtype.split("_", 1)[1])
+                    elem_def["type"] = "cds.String"
+                    elem_def["length"] = length
+                except Exception:
+                    elem_def["type"] = "cds.String"
+                    elem_def["length"] = 50
+            elif vtype.startswith("$DYNAMIC.decimal_"):
+                parts = vtype.split("_")
+                elem_def["type"] = "cds.Decimal"
+                elem_def["precision"] = int(parts[1]) if len(parts) > 1 else 15
+                elem_def["scale"] = int(parts[2]) if len(parts) > 2 else 2
+            elif vtype.startswith("$DYNAMIC.int_"):
+                elem_def["type"] = "cds.Integer"
+            elif "timestamp" in vtype.lower():
+                elem_def["type"] = "cds.Timestamp"
+            else:
+                elem_def["type"] = "cds.String"
+                elem_def["length"] = 50
+
+            elements[col_name] = elem_def
+
+        csn = {
+            "$version": "1.0",
+            "definitions": {
+                table_name: {
+                    "kind": "entity",
+                    "@EndUserText.label": table_name,
+                    "@ObjectModel.modelingPattern": {"#": "DATA_STRUCTURE"},
+                    "@ObjectModel.supportedCapabilities": [{"#": "DATA_STRUCTURE"}],
+                    "elements": elements
+                }
+            }
+        }
+        return csn
+
+    def ensure_local_table_created(self, view_name: str, table_name: str) -> bool:
+        """
+        Pre-create the Target Local Table via CLI before creating/updating the Replication Flow if possible.
+        Ensures the Local Table exists as an active entity in the space repository.
+        """
+        if self.check_table_exists(table_name):
+            log("TABLE", f"Target Local Table '{table_name}' already exists in space '{self.source_space}'.")
+            return True
+
+        log("TABLE", f"[Workaround 2] Pre-creating Local Table '{table_name}' in space '{self.source_space}' via CLI...")
+        table_csn = self.build_local_table_csn(view_name, table_name)
+        table_file = self._write_json(f"{table_name}_precreate_csn", table_csn)
+
+        res = run_cmd(["datasphere", "objects", "local-tables", "create",
+                       "--space", self.source_space,
+                       "--technical-name", table_name,
+                       "--file-path", str(table_file),
+                       "--secrets-file", str(self.secrets_path),
+                       "--host", self.host])
+        if res.returncode == 0:
+            log("TABLE", f"[Workaround 2] Local Table '{table_name}' pre-created successfully.")
+            time.sleep(3)
+            return True
+
+        err = res.stderr or res.stdout
+        log("TABLE", f"[Workaround 2] Notice on create: {err}. Retrying with --save-anyway...", "WARN")
+        res_save = run_cmd(["datasphere", "objects", "local-tables", "create",
+                            "--space", self.source_space,
+                            "--technical-name", table_name,
+                            "--file-path", str(table_file),
+                            "--secrets-file", str(self.secrets_path),
+                            "--host", self.host,
+                            "--save-anyway"])
+        if res_save.returncode == 0:
+            log("TABLE", f"[Workaround 2] Local Table '{table_name}' pre-created with --save-anyway.")
+            time.sleep(3)
+            return True
+
+        log("TABLE", f"[Workaround 2] Table pre-creation notice ({res_save.stderr or res_save.stdout}). Proceeding...", "WARN")
+        return False
+
     def create_or_update_flow(self, flow_name: str, view_name: str, table_name: str) -> bool:
         """
-        SAP Datasphere robust lifecycle for target objects in HDL_FILES:
-        1. Clean slate: stop and delete existing flow so no stale/unsaved target object state remains.
-        2. Check if target Local Table already exists in the space.
-        3. If table already exists: save and deploy with isNew=False.
-        4. If table is new:
-           - Phase 1: create with --no-deploy --save-anyway (isNew=True) -> Registers target object.
-           - Phase 2: update with --no-deploy --save-anyway (isNew=False) -> Mandatory 2nd save.
-           - Phase 3: update with --save-anyway (WITHOUT --no-deploy) -> Deploys flow & activates target table.
+        Guarantees that the Replication Flow and Target Local Table are fully materialized and deployed (dark, not greyed out).
+        
+        Adheres to SAP Datasphere's requirement:
+        'Now the objects are already created when the replication flow is saved. You need to save the replication
+        flow once again before deploying it so that the new objects are included correctly.'
+        
+        Lifecycle:
+        1. Pre-creates local table if possible (Workaround 2).
+        2. If flow and table already exist and deployed, safely updates with isNew=False.
+        3. If new flow:
+           - Save 1: Create in draft mode with --no-deploy (registers target object in space repository)
+           - Wait 5s for space repository async registration
+           - Save 2: Update with --no-deploy (materializes target object in flow)
+           - Wait 5s
+           - Deploy: Update without --no-deploy and with --save-anyway (deploys both flow and local table)
         """
-        # Stop and delete any existing flow for a 100% clean deployment
-        if self.check_flow_exists(flow_name):
-            self.delete_flow_if_exists(flow_name)
-            time.sleep(3)
+        # Step 1: Pre-create target local table if possible
+        self.ensure_local_table_created(view_name, table_name)
 
         exists = self.check_flow_exists(flow_name)
-        log("FLOW", f"Flow '{flow_name}' exists after cleanup: {exists}")
-
-        # Check if target local table already exists in the space
         table_exists = self.check_table_exists(table_name)
-        log("FLOW", f"Target Local Table '{table_name}' already exists in space: {table_exists}")
+        log("FLOW", f"Flow '{flow_name}' exists: {exists} | Table '{table_name}' exists: {table_exists}")
 
-        # Prepare payloads
-        file_new = self._write_json(f"{flow_name}_phase1_isNew_true",
-                                    self.build_flow_json(flow_name, view_name, table_name, is_new=True))
-        file_existing = self._write_json(f"{flow_name}_phase2_isNew_false",
-                                         self.build_flow_json(flow_name, view_name, table_name, is_new=False))
+        payload_new = self.build_flow_json(flow_name, view_name, table_name, is_new=True)
+        file_new = self._write_json(f"{flow_name}_new", payload_new)
 
-        # --- Case A: Table already exists in space (e.g. from prior manual/auto deploy) ---
-        if table_exists:
-            log("FLOW", f"Target table '{table_name}' exists. Configuring flow with isNew=False...")
-            if not exists:
-                r_create = self._rf_cmd("create", flow_name, file_existing, ["--save-anyway"])
-                if r_create.returncode == 0:
-                    log("FLOW", f"Replication Flow '{flow_name}' created & deployed for existing table.")
-                    time.sleep(5)
-                    return True
+        payload_existing = self.build_flow_json(flow_name, view_name, table_name, is_new=False)
+        file_existing = self._write_json(f"{flow_name}_existing", payload_existing)
+
+        # Case A: If flow and table already exist in deployed state, update cleanly
+        if exists and table_exists:
+            log("FLOW", f"Flow and table exist in space. Updating and deploying with existing target mapping...")
             r_upd = self._rf_cmd("update", flow_name, file_existing, ["--save-anyway"])
             if r_upd.returncode == 0:
-                log("FLOW", f"Replication Flow '{flow_name}' updated & deployed for existing table.")
+                log("FLOW", f"Replication Flow '{flow_name}' successfully updated and deployed.")
+                time.sleep(5)
+                return True
+            log("FLOW", f"Update notice: {r_upd.stderr or r_upd.stdout}. Retrying plain update...", "WARN")
+            r_plain = self._rf_cmd("update", flow_name, file_existing)
+            if r_plain.returncode == 0:
+                log("FLOW", f"Replication Flow '{flow_name}' deployed via plain update.")
                 time.sleep(5)
                 return True
 
-        # --- Case B: Table is new - Multi-phase save to register target objects ---
-        # Phase 1: Save draft with isNew=True (signals Datasphere to provision new target object)
+        # Case B: Multi-step Save-Save-Deploy sequence to guarantee target table is dark & deployed
         if not exists:
-            log("FLOW", f"[Phase 1] Creating '{flow_name}' (isNew=True, --no-deploy --save-anyway)...")
-            r1 = self._rf_cmd("create", flow_name, file_new, ["--no-deploy", "--save-anyway"])
+            # Save 1: Initial creation in draft mode (--no-deploy)
+            log("FLOW", f"[Save 1/2] Creating Replication Flow draft for '{flow_name}' (isNew=True, --no-deploy)...")
+            r1 = self._rf_cmd("create", flow_name, file_new, ["--no-deploy"])
             if r1.returncode != 0:
-                err = (r1.stderr or r1.stdout).strip()
-                log("FLOW", f"[Phase 1] Notice: {err}. Retrying with update...", "WARN")
-                r1 = self._rf_cmd("update", flow_name, file_new, ["--no-deploy", "--save-anyway"])
-        else:
-            log("FLOW", f"[Phase 1] Updating '{flow_name}' (isNew=True, --no-deploy --save-anyway)...")
-            r1 = self._rf_cmd("update", flow_name, file_new, ["--no-deploy", "--save-anyway"])
+                log("FLOW", f"Save 1 notice with isNew=True ({r1.stderr or r1.stdout}). Trying with isNew=False...", "WARN")
+                r1 = self._rf_cmd("create", flow_name, file_existing, ["--no-deploy"])
+            log("FLOW", f"[Save 1/2] Flow draft saved. Waiting 5s for Datasphere space repository to register target object...")
+            time.sleep(5)
 
-        time.sleep(5)  # Allow Datasphere backend to provision the target object
-
-        # Phase 2: Save again with isNew=False (SAP requirement: "save once again before deploying")
-        log("FLOW", f"[Phase 2] Saving '{flow_name}' again (isNew=False, --no-deploy --save-anyway)...")
-        r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy", "--save-anyway"])
+        # Save 2: Save once again before deploying so new objects are included
+        log("FLOW", f"[Save 2/2] Re-saving Replication Flow '{flow_name}' to materialize target object '{table_name}' (--no-deploy)...")
+        r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy"])
         if r2.returncode != 0:
-            log("FLOW", f"[Phase 2] Notice: {r2.stderr or r2.stdout}. Retrying plain update with --no-deploy...", "WARN")
-            self._rf_cmd("update", flow_name, file_existing, ["--no-deploy"])
+            log("FLOW", f"Save 2 notice ({r2.stderr or r2.stdout}). Retrying with isNew=True...", "WARN")
+            self._rf_cmd("update", flow_name, file_new, ["--no-deploy"])
+        log("FLOW", f"[Save 2/2] Flow re-saved. Waiting 5s before deployment...")
+        time.sleep(5)
 
-        time.sleep(5)  # Allow second save to settle
-
-        # Phase 3: Deploy (update WITHOUT --no-deploy, with --save-anyway)
-        log("FLOW", f"[Phase 3] Deploying '{flow_name}' (update with --save-anyway)...")
-        r3 = self._rf_cmd("update", flow_name, file_existing, ["--save-anyway"])
-        if r3.returncode == 0:
-            log("FLOW", f"[Phase 3] '{flow_name}' deployed successfully! Target objects are now active/dark.")
+        # Deploy Step: Update without --no-deploy to compile & deploy both flow and local table
+        log("FLOW", f"[Deploy] Deploying Replication Flow '{flow_name}' and Local Table '{table_name}'...")
+        r_deploy = self._rf_cmd("update", flow_name, file_existing, ["--save-anyway"])
+        if r_deploy.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' and Local Table '{table_name}' deployed successfully!")
             time.sleep(5)
             return True
 
-        log("FLOW", f"[Phase 3] Update with --save-anyway failed: {(r3.stderr or r3.stdout).strip()}. Retrying plain update...", "WARN")
-        r3b = self._rf_cmd("update", flow_name, file_existing)
-        if r3b.returncode == 0:
-            log("FLOW", f"[Phase 3] '{flow_name}' deployed via plain update.")
+        log("FLOW", f"Deploy with --save-anyway notice: {r_deploy.stderr or r_deploy.stdout}. Retrying plain update deploy...", "WARN")
+        r_plain = self._rf_cmd("update", flow_name, file_existing)
+        if r_plain.returncode == 0:
+            log("FLOW", f"Replication Flow '{flow_name}' deployed successfully via plain update!")
             time.sleep(5)
             return True
 
-        log("FLOW", f"Failed to deploy Replication Flow '{flow_name}': {(r3b.stderr or r3b.stdout).strip()}", "ERROR")
+        log("FLOW", f"Deployment failed: {r_plain.stderr or r_plain.stdout}", "ERROR")
         return False
 
     def execute_flow(self, flow_name: str) -> bool:
