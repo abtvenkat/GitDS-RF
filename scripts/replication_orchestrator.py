@@ -9,7 +9,7 @@ following the official SAP 9-step automation sequence:
   Step 3: Configure source objects
   Step 4: Generate target Local Tables / target objects
   Step 5: Save Replication Flow (initial save to register targets)
-  Step 6: Save again to persist newly created target objects
+  Step 6: Save again to persist newly created target objects (Mandatory validation)
   Step 7: Deploy Replication Flow
   Step 8: Execute Replication Flow
   Step 9: Monitor replication status
@@ -82,6 +82,18 @@ class ReplicationOrchestrator:
         self.results = {}
         self.report_dir = Path("reports")
         self.report_dir.mkdir(exist_ok=True)
+
+        self.step_status = {
+            "step1": "NOT_RUN",
+            "step2": "NOT_RUN",
+            "step3": "NOT_RUN",
+            "step4": "NOT_RUN",
+            "step5": "NOT_RUN",
+            "step6": "NOT_RUN",
+            "step7": "NOT_RUN",
+            "step8": "NOT_RUN",
+            "step9": "NOT_RUN"
+        }
 
     def cleanup(self):
         try:
@@ -455,21 +467,25 @@ class ReplicationOrchestrator:
           Step 3: Configure source objects
           Step 4: Generate target Local Tables / objects
           Step 5: Save Replication Flow (initial save with isNew=True, --no-deploy)
-          Step 6: Save again to persist newly created target objects (isNew=False, --no-deploy)
+          Step 6: Save again to persist newly created target objects (Mandatory validation)
           Step 7: Deploy Replication Flow
         """
         # Step 2: Check flow existence
         exists = self.check_flow_exists(flow_name)
         log("STEP 2", f"Create or update Replication Flow '{flow_name}' (Exists in space '{self.source_space}': {exists})")
+        self.step_status["step2"] = "PASSED"
 
         # Step 3 & 4: Configure source and target objects
         log("STEP 3", f"Configuring source objects for {len(views)} CDS views ({', '.join(views)})...")
+        self.step_status["step3"] = "PASSED"
+
         log("STEP 4", f"Generating target Local Table definitions with CDC mode and timestamp columns...")
         payload_new = self.build_consolidated_flow_json(flow_name, views, is_new=True)
         file_new = self._write_json(f"{flow_name}_stage1", payload_new)
 
         payload_existing = self.build_consolidated_flow_json(flow_name, views, is_new=False)
         file_existing = self._write_json(f"{flow_name}_stage2", payload_existing)
+        self.step_status["step4"] = "PASSED"
 
         # ---------------------------------------------------------------------
         # STEP 5: Save Replication Flow (Initial draft save with --no-deploy)
@@ -485,15 +501,17 @@ class ReplicationOrchestrator:
             log("STEP 5", f"Save notice ({r1.stderr or r1.stdout}). Retrying with --save-anyway...", "WARN")
             r1 = self._rf_cmd("update", flow_name, file_new, ["--no-deploy", "--save-anyway"])
             if r1.returncode != 0:
+                self.step_status["step5"] = "FAILED"
                 log("STEP 5", f"Failed Step 5 save for flow '{flow_name}': {r1.stderr or r1.stdout}", "ERROR")
                 return False
 
+        self.step_status["step5"] = "PASSED"
         log("STEP 5", f"Replication Flow '{flow_name}' draft saved successfully. Target objects initialized.")
         log("FLOW", "Waiting 5 seconds for target object persistence in space repository...")
         time.sleep(5)
 
         # ---------------------------------------------------------------------
-        # STEP 6: Save again to persist newly created target objects
+        # STEP 6: Save again to persist newly created target objects (MANDATORY)
         # ---------------------------------------------------------------------
         log("STEP 6", f"Save again to persist newly created target objects (isNew: false, --no-deploy)...")
         r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy"])
@@ -501,9 +519,14 @@ class ReplicationOrchestrator:
             log("STEP 6", f"Notice during Step 6: {r2.stderr or r2.stdout}. Retrying with --save-anyway...", "WARN")
             r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy", "--save-anyway"])
             if r2.returncode != 0:
-                log("STEP 6", f"Warning during Step 6: {r2.stderr or r2.stdout}. Proceeding to deploy...", "WARN")
-        else:
-            log("STEP 6", f"Replication Flow '{flow_name}' saved again. Newly created target objects are now persisted.")
+                # CRITICAL: Step 6 is mandatory. If persistence fails, do NOT proceed to deployment!
+                self.step_status["step6"] = "FAILED"
+                log("STEP 6", f"Failed to persist newly created target objects for flow '{flow_name}': {r2.stderr or r2.stdout}", "ERROR")
+                log("STEP 6", "Aborting deployment because target objects were not successfully persisted.", "ERROR")
+                return False
+
+        self.step_status["step6"] = "PASSED"
+        log("STEP 6", f"Replication Flow '{flow_name}' saved again. Newly created target objects are now persisted.")
         time.sleep(5)
 
         # ---------------------------------------------------------------------
@@ -512,6 +535,7 @@ class ReplicationOrchestrator:
         log("STEP 7", f"Deploy Replication Flow '{flow_name}' and target structures...")
         r_deploy = self._rf_cmd("update", flow_name, file_existing, [])
         if r_deploy.returncode == 0:
+            self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' and all target structures successfully deployed!")
             time.sleep(5)
             return True
@@ -520,6 +544,7 @@ class ReplicationOrchestrator:
         log("STEP 7", f"Standard deploy notice: {err}. Retrying deploy with --deploy-anyway...", "WARN")
         r_deploy2 = self._rf_cmd("update", flow_name, file_existing, ["--deploy-anyway"])
         if r_deploy2.returncode == 0:
+            self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed with --deploy-anyway!")
             time.sleep(5)
             return True
@@ -527,11 +552,13 @@ class ReplicationOrchestrator:
         log("STEP 7", f"Notice with --deploy-anyway: {r_deploy2.stderr or r_deploy2.stdout}. Retrying deploy with --save-anyway...", "WARN")
         r_deploy3 = self._rf_cmd("update", flow_name, file_existing, ["--save-anyway"])
         if r_deploy3.returncode == 0:
+            self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed with --save-anyway!")
             time.sleep(5)
             return True
 
-        log("STEP 7", f"Deployment attempt returned: {r_deploy3.stderr or r_deploy3.stdout}. Attempting execution check...", "WARN")
+        self.step_status["step7"] = "FAILED"
+        log("STEP 7", f"Deployment failed: {r_deploy3.stderr or r_deploy3.stdout}", "ERROR")
         return False
 
     # -------------------------------------------------------------------------
@@ -546,8 +573,10 @@ class ReplicationOrchestrator:
                        "--host", self.host])
         if res.returncode != 0:
             err = (res.stderr or res.stdout).strip()
+            self.step_status["step8"] = "FAILED"
             log("STEP 8", f"Flow execution notice: {err}", "ERROR")
             return False
+        self.step_status["step8"] = "PASSED"
         log("STEP 8", f"Replication Flow '{flow_name}' execution successfully triggered.")
         return True
 
@@ -566,9 +595,11 @@ class ReplicationOrchestrator:
                            "--host", self.host])
             status_text = (res.stdout or res.stderr).strip().upper()
             if any(s in status_text for s in ("COMPLETED", "FINISHED", "SUCCESS", "SUCCEEDED")):
+                self.step_status["step9"] = "PASSED"
                 log("STEP 9", f"Replication Flow '{flow_name}' completed successfully!")
                 return "COMPLETED"
             elif any(s in status_text for s in ("FAILED", "ERROR", "ABORTED")):
+                self.step_status["step9"] = "FAILED"
                 log("STEP 9", f"Replication Flow '{flow_name}' failed: {status_text}", "ERROR")
                 return "FAILED"
             elif any(s in status_text for s in ("RUNNING", "ACTIVE", "IN_PROGRESS", "INITIAL_LOAD", "REPLICATING", "STARTED")):
@@ -578,6 +609,7 @@ class ReplicationOrchestrator:
                 last_status = status_text or "PENDING"
                 log("STEP 9", f"Replication Flow '{flow_name}' status: {last_status}")
             time.sleep(self.poll_interval)
+        self.step_status["step9"] = "TIMEOUT"
         log("STEP 9", f"Replication Flow '{flow_name}' monitoring timed out after {self.timeout_sec}s.", "WARN")
         return f"TIMEOUT ({last_status})"
 
@@ -585,6 +617,17 @@ class ReplicationOrchestrator:
         log("REPORT", "Generating execution report...")
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         is_success = flow_status in ("COMPLETED", "SUCCESS")
+
+        def badge(step_key: str) -> str:
+            st = self.step_status.get(step_key, "NOT_RUN")
+            if st == "PASSED":
+                return "`[PASSED]`"
+            elif st == "FAILED":
+                return "`[FAILED]`"
+            elif st == "TIMEOUT":
+                return "`[TIMEOUT]`"
+            else:
+                return "`[NOT_RUN]`"
 
         lines = [
             "# SAP Datasphere Replication Flow Execution Report",
@@ -595,15 +638,15 @@ class ReplicationOrchestrator:
             f"**Status:** `{flow_status}`  ",
             "",
             "### 9-Step Automation Execution Sequence",
-            "1. `[PASSED]` Authenticate using Datasphere technical user",
-            "2. `[PASSED]` Create or update Replication Flow",
-            "3. `[PASSED]` Configure source objects",
-            "4. `[PASSED]` Generate target Local Tables / target objects",
-            "5. `[PASSED]` Save Replication Flow (Initial draft save)",
-            "6. `[PASSED]` Save again to persist newly created target objects",
-            "7. `[PASSED]` Deploy Replication Flow",
-            f"8. `[{'PASSED' if flow_status != 'DEPLOYMENT_FAILED' else 'FAILED'}]` Execute Replication Flow",
-            f"9. `[{'PASSED' if is_success else 'PENDING/FAILED'}]` Monitor replication status ({flow_status})",
+            f"1. {badge('step1')} Authenticate using Datasphere technical user",
+            f"2. {badge('step2')} Create or update Replication Flow",
+            f"3. {badge('step3')} Configure source objects",
+            f"4. {badge('step4')} Generate target Local Tables / target objects",
+            f"5. {badge('step5')} Save Replication Flow (Initial draft save)",
+            f"6. {badge('step6')} Save again to persist newly created target objects",
+            f"7. {badge('step7')} Deploy Replication Flow",
+            f"8. {badge('step8')} Execute Replication Flow",
+            f"9. {badge('step9')} Monitor replication status ({flow_status})",
             "",
             "| CDS View | Replication Flow | Target Object | Load Type | Status |",
             "| :--- | :--- | :--- | :--- | :--- |"
@@ -625,7 +668,8 @@ class ReplicationOrchestrator:
                 "flow_name": self.flow_name,
                 "source_space": self.source_space,
                 "status": flow_status,
-                "views": views
+                "views": views,
+                "step_status": self.step_status
             }, f, indent=2)
 
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")
@@ -666,18 +710,21 @@ class ReplicationOrchestrator:
 
             # Step 1: Authenticate using Datasphere technical user
             self.authenticate_datasphere()
+            self.step_status["step1"] = "PASSED"
             self.validate_connection()
 
             # Steps 2, 3, 4, 5, 6, 7: Configure, Two-Stage Save & Deploy
             deployed = self.create_or_update_flow(self.flow_name, views_to_process)
             if not deployed:
-                log("PROCESS", f"Deployment reported notices; verifying if Replication Flow '{self.flow_name}' is runnable...", "WARN")
+                log("PROCESS", f"Replication Flow '{self.flow_name}' save or deploy failed; aborting execution.", "ERROR")
+                fail_status = "PERSISTENCE_FAILED" if self.step_status["step6"] == "FAILED" else ("DRAFT_SAVE_FAILED" if self.step_status["step5"] == "FAILED" else "DEPLOYMENT_FAILED")
+                return self.generate_report(views_to_process, fail_status)
 
             # Step 8: Execute Replication Flow
             executed = self.execute_flow(self.flow_name)
             if not executed:
                 log("RUN", f"Failed to run Replication Flow '{self.flow_name}'.", "ERROR")
-                return self.generate_report(views_to_process, "EXECUTION_FAILED" if deployed else "DEPLOYMENT_FAILED")
+                return self.generate_report(views_to_process, "EXECUTION_FAILED")
 
             # Step 9: Monitor replication status
             flow_status = self.monitor_flow(self.flow_name)
