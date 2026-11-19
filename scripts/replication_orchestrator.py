@@ -336,10 +336,12 @@ class ReplicationOrchestrator:
     # -------------------------------------------------------------------------
     # STEP 2, 3, 4: Build Consolidated Flow with Source and Target Definitions
     # -------------------------------------------------------------------------
-    def generate_local_tables_csn(self, views: list) -> Path:
+    def build_definitions(self, views: list) -> dict:
         """
-        Generates standard SAP Datasphere CSN JSON for all target Local Tables.
-        Saved to reports/local_tables_csn.json for reference or UI import.
+        Builds standard CSN entity definitions for Delta Lake targets in HDL_FILES space.
+        These definitions are embedded into the root of the Replication Flow CSN payload
+        so SAP Datasphere compiles and creates the target Delta Lake entities in Data Lake Files.
+        Also saved to reports/local_tables_csn.json for reference.
         """
         definitions = {}
         for view in views:
@@ -350,6 +352,27 @@ class ReplicationOrchestrator:
                 cname = col["name"]
                 vtype = col.get("vtype-ID", "")
                 is_key = col.get("key", False)
+
+                if cname == "Change_Type":
+                    elements[cname] = {
+                        "@EndUserText.label": "Change_Type",
+                        "type": "cds.String",
+                        "key": False,
+                        "notNull": True,
+                        "length": 1,
+                        "default": {"val": "I"}
+                    }
+                    continue
+                if cname == "Change_Date":
+                    elements[cname] = {
+                        "@EndUserText.label": "Change_Date",
+                        "type": "cds.Timestamp",
+                        "key": False,
+                        "notNull": True,
+                        "default": {"func": "CURRENT_UTCTIMESTAMP"}
+                    }
+                    continue
+
                 if "string" in vtype:
                     try:
                         length = int(vtype.split("_")[-1])
@@ -361,19 +384,23 @@ class ReplicationOrchestrator:
                     elem_def = {"type": "cds.Decimal", "precision": int(parts[1]), "scale": int(parts[2])}
                 elif "timestamp" in vtype:
                     elem_def = {"type": "cds.Timestamp"}
+                elif "int" in vtype:
+                    elem_def = {"type": "cds.Integer"}
                 else:
                     elem_def = {"type": "cds.String", "length": 50}
 
                 if is_key:
                     elem_def["key"] = True
                     elem_def["notNull"] = True
+                else:
+                    elem_def["key"] = False
                 if col.get("businessName"):
                     elem_def["@EndUserText.label"] = col["businessName"]
                 elements[cname] = elem_def
 
             definitions[table_name] = {
                 "kind": "entity",
-                "@EndUserText.label": f"Local Table for {view}",
+                "@EndUserText.label": f"Delta Lake Entity for {view}",
                 "@ObjectModel.modelingPattern": {"#": "DATA_STRUCTURE"},
                 "@ObjectModel.supportedCapabilities": [{"#": "DATA_STRUCTURE"}],
                 "@DataWarehouse.delta": {
@@ -381,27 +408,41 @@ class ReplicationOrchestrator:
                     "dateTimeElement": {"=": "Change_Date"},
                     "modeElement": {"=": "Change_Type"}
                 },
+                "@DataWarehouse.enclosingObject": view,
                 "@DataWarehouse.persistence.hdlf.tableFormat": {"#": "DELTA_LAKE"},
                 "@cds.persistence.udf": True,
-                "elements": elements
+                "elements": elements,
+                "_meta": {
+                    "dependencies": {
+                        "folderAssignment": None
+                    }
+                }
             }
 
         csn_payload = {"$version": "1.0", "definitions": definitions}
         csn_path = self.report_dir / "local_tables_csn.json"
         with open(csn_path, "w", encoding="utf-8") as f:
             json.dump(csn_payload, f, indent=2)
-        log("TABLES", f"Generated Local Tables CSN definition at '{csn_path}'.")
-        return csn_path
+        log("TABLES", f"Generated target definitions CSN at '{csn_path}'.")
+        return definitions
+
+    def generate_local_tables_csn(self, views: list) -> Path:
+        """Backwards compatibility alias for build_definitions."""
+        self.build_definitions(views)
+        return self.report_dir / "local_tables_csn.json"
 
     def build_consolidated_flow_json(self, flow_name: str, views: list) -> dict:
         """
-        Builds a SINGLE Replication Flow JSON containing all CDS Views as separate replication tasks.
-        Approach A: All target objects are configured as EXISTING objects (isNew: False).
-        This eliminates the 'unsaved target objects' warning and removes the greyed-out state.
+        Builds a SINGLE Replication Flow CSN JSON containing:
+        1. Root '$version', 'version', and 'meta'
+        2. Root 'definitions' containing Delta Lake entity definitions for HDL_FILES
+        3. 'replicationflows' with all CDS Views mapped to their Delta Lake targets
         """
         target_conn_id = self.target_conn if self.target_conn not in ("DATASPHERE_LOCAL", "", None) else "DWC_HDLF"
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
         source_container = f"/{self.source_container.lstrip('/')}"
+
+        definitions = self.build_definitions(views)
 
         all_cols = []
         replication_tasks = []
@@ -428,7 +469,7 @@ class ReplicationOrchestrator:
                 "targetObject": {
                     "name": table_name,
                     "definition": {"columns": target_cols, "keys": keys},
-                    "metadata": {"isNew": False},  # Approach A: Target is an existing Local Table
+                    "metadata": {"isNew": False},  # Bound to definitions embedded in the CSN document
                     "properties": {
                         "com.sap.datasuite.cdc.mode.column": "Change_Type",
                         "com.sap.datasuite.cdc.timestamp.column": "Change_Date",
@@ -487,7 +528,13 @@ class ReplicationOrchestrator:
             "connections": {self.source_conn: {}}
         }
 
-        return {"replicationflows": {flow_name: flow_body}}
+        return {
+            "$version": "1.0",
+            "version": {"csn": "1.0"},
+            "meta": {"creator": "CDS Compiler v1.19.2"},
+            "definitions": definitions,
+            "replicationflows": {flow_name: flow_body}
+        }
 
     def _write_json(self, name: str, data: dict) -> Path:
         path = Path(self.temp_dir.name) / f"{name}.json"
@@ -540,12 +587,12 @@ class ReplicationOrchestrator:
     # -------------------------------------------------------------------------
     def create_or_update_flow(self, flow_name: str, views: list) -> bool:
         """
-        Executes Approach A:
+        Executes the official SAP 9-Step Automation Sequence for HDL_FILES spaces:
           Step 2: Check flow existence
           Step 3: Configure source objects
-          Step 4: Map to existing target Local Tables (isNew: false)
-          Step 5: Save Replication Flow (with isNew: false, --no-deploy)
-          Step 6: Confirm target persistence (Instant PASS - targets pre-exist)
+          Step 4: Generate target Delta Lake definitions & CSN payload
+          Step 5: Save Replication Flow draft (--no-deploy)
+          Step 6: Save again to persist newly created target objects (Mandatory validation)
           Step 7: Deploy Replication Flow
         """
         # Step 2: Check flow existence
@@ -557,18 +604,17 @@ class ReplicationOrchestrator:
         log("STEP 3", f"Configuring source objects for {len(views)} CDS views ({', '.join(views)})...")
         self.step_status["step3"] = "PASSED"
 
-        # Step 4: Map to existing target Local Tables (Approach A: isNew=False)
-        log("STEP 4", f"Mapping to existing target Local Tables (Approach A: isNew=False)...")
-        self.generate_local_tables_csn(views)
+        # Step 4: Generate target Delta Lake definitions & build consolidated payload
+        log("STEP 4", f"Generating target Delta Lake definitions (CSN) for {len(views)} views in HDL_FILES space...")
         payload = self.build_consolidated_flow_json(flow_name, views)
         flow_file = self._write_json(f"{flow_name}_consolidated", payload)
         self.step_status["step4"] = "PASSED"
 
         # ---------------------------------------------------------------------
-        # STEP 5: Save Replication Flow (with isNew: False, --no-deploy)
+        # STEP 5: Save Replication Flow draft (initial save to register targets)
         # ---------------------------------------------------------------------
         action = "update" if exists else "create"
-        log("STEP 5", f"Save Replication Flow '{flow_name}' with existing target mapping (isNew: false, --no-deploy)...")
+        log("STEP 5", f"Save Replication Flow '{flow_name}' draft (--no-deploy)...")
         r1 = self._rf_cmd(action, flow_name, flow_file, ["--no-deploy"])
         if r1.returncode != 0 and not exists:
             log("STEP 5", f"Create returned notice ({r1.stderr or r1.stdout}). Retrying with update...", "WARN")
@@ -583,15 +629,25 @@ class ReplicationOrchestrator:
                 return False
 
         self.step_status["step5"] = "PASSED"
-        log("STEP 5", f"Replication Flow '{flow_name}' draft saved successfully with existing target mapping.")
+        log("STEP 5", f"Replication Flow '{flow_name}' draft saved successfully.")
         time.sleep(3)
 
         # ---------------------------------------------------------------------
-        # STEP 6: Confirm target object persistence (Approach A)
+        # STEP 6: Save again to persist newly created target objects (Mandatory validation)
         # ---------------------------------------------------------------------
-        log("STEP 6", f"Validate target objects persistence (Approach A: mapped to existing Local Tables)...")
+        log("STEP 6", f"Save again to persist newly created target objects for '{flow_name}'...")
+        r2 = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy"])
+        if r2.returncode != 0:
+            log("STEP 6", f"Notice during Step 6: {r2.stderr or r2.stdout}. Retrying with --save-anyway...", "WARN")
+            r2 = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy", "--save-anyway"])
+
+        if r2.returncode != 0:
+            self.step_status["step6"] = "FAILED"
+            log("STEP 6", f"Step 6 target object persistence failed: {r2.stderr or r2.stdout}", "ERROR")
+            return False
+
         self.step_status["step6"] = "PASSED"
-        log("STEP 6", f"Target objects confirmed as existing persisted tables. No draft locks or unsaved target warnings.")
+        log("STEP 6", f"Target objects successfully persisted and validated for '{flow_name}'.")
         time.sleep(2)
 
         # ---------------------------------------------------------------------
@@ -702,13 +758,13 @@ class ReplicationOrchestrator:
             f"**Source Connection:** `{self.source_conn}`  ",
             f"**Status:** `{flow_status}`  ",
             "",
-            "### 9-Step Automation Execution Sequence (Approach A)",
+            "### 9-Step Automation Execution Sequence (HDL_FILES Data Lake Files)",
             f"1. {badge('step1')} Authenticate using Datasphere technical user",
             f"2. {badge('step2')} Create or update Replication Flow",
             f"3. {badge('step3')} Configure source objects",
-            f"4. {badge('step4')} Map to existing target Local Tables (isNew: false)",
-            f"5. {badge('step5')} Save Replication Flow (isNew: false)",
-            f"6. {badge('step6')} Validate target Local Table persistence",
+            f"4. {badge('step4')} Generate target Delta Lake definitions (CSN embedded)",
+            f"5. {badge('step5')} Save Replication Flow draft (--no-deploy)",
+            f"6. {badge('step6')} Save again to persist target objects (Mandatory validation)",
             f"7. {badge('step7')} Deploy Replication Flow",
             f"8. {badge('step8')} Execute Replication Flow",
             f"9. {badge('step9')} Monitor replication status ({flow_status})",

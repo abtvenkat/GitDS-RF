@@ -13,13 +13,23 @@ flowchart TD
     C --> D["Checkout & Change Detection (git diff)"]
     D --> E["Authenticate with SAP Datasphere (@sap/datasphere-cli)"]
     E --> F["Validate Source Connection & Space"]
-    F --> G["Map Target to Existing Local Tables (isNew: false)"]
-    G --> H["Save Replication Flow (--no-deploy)"]
-    H --> I["Deploy Replication Flow (update)"]
-    I --> J["Execute Replication Flow (tasks run)"]
-    J --> K["Monitor Execution until COMPLETED"]
-    K --> L["Generate Execution Report & CSN Artifacts"]
+    F --> G["Build CSN with Delta Lake Target Definitions (HDL_FILES)"]
+    G --> H["Save Replication Flow Draft (--no-deploy)"]
+    H --> I["Mandatory Step 6: Save Again to Persist Target Entities"]
+    I --> J["Deploy Replication Flow (update)"]
+    J --> K["Execute Replication Flow (tasks run)"]
+    K --> L["Monitor Execution until COMPLETED"]
+    L --> M["Generate Execution Report & CSN Artifacts"]
 ```
+
+---
+
+> [!IMPORTANT]
+> **Data Lake File Storage Type Spaces (`HDL_FILES` / `DWC_HDLF`):**
+> If your Datasphere space uses **Data Lake File storage type**, target data is stored as **Delta Lake / Parquet files** in SAP HANA Data Lake Files (`DWC_HDLF`).
+> - **Standard relational Local Tables are NOT used or created** in an HDL_FILES space; they do not appear under the "Local Tables" tab in Data Builder.
+> - Instead, target entities are created as **Delta Lake file entities** (`@DataWarehouse.persistence.hdlf.tableFormat: DELTA_LAKE`) embedded directly in the CSN document.
+> - The files are stored in the Data Lake Files container under `/<space_name>/<target_entity_name>/`.
 
 ---
 
@@ -72,25 +82,25 @@ Configure your GitHub repository: **Settings** → **Secrets and variables** →
 
 ---
 
-## 3. Official 9-Step Automation Sequence (Approach A: Existing Target Mapping)
+## 3. Official 9-Step Automation Sequence (Data Lake Files / HDL_FILES)
 
-To guarantee 100% deployment reliability and avoid SAP's backend draft-locking bug (*"There are unsaved target objects. Please save again"*), the pipeline maps target objects directly as existing Local Tables (`isNew: false`):
+To guarantee 100% deployment reliability and target entity persistence in Data Lake File storage spaces (`HDL_FILES`), the pipeline follows SAP's official 9-step sequence:
 
 | Step | Operation | Implementation Detail |
 | :--- | :--- | :--- |
 | **1** | **Authenticate using Datasphere technical user** | Headless OAuth2 client credentials pre-fetch & `@sap/datasphere-cli login` |
-| **2** | **Create or update Replication Flow** | Checks space for existing technical name & builds consolidated payload |
+| **2** | **Create or update Replication Flow** | Checks space for existing technical name & initializes consolidated flow |
 | **3** | **Configure source objects** | Maps source CDS view columns, keys, and extraction container |
-| **4** | **Map target Local Tables (`isNew: false`)** | Sets `isNew: false` referencing target tables; exports `reports/local_tables_csn.json` |
-| **5** | **Save Replication Flow** | Saves flow draft with `--no-deploy` (clean registration without draft locks) |
-| **6** | **Validate target persistence** | Confirms target tables are mapped as existing persisted objects |
+| **4** | **Generate target Delta Lake definitions (CSN)** | Embeds full Delta Lake entity definitions (`DELTA_LAKE` format, CDC annotations) directly into CSN |
+| **5** | **Save Replication Flow draft** | Saves flow draft with `--no-deploy` to register replication tasks and target bindings |
+| **6** | **Save again to persist target objects (Mandatory)** | Executes mandatory second save to validate target persistence; fails if unpersisted |
 | **7** | **Deploy Replication Flow** | Deploys flow and active bindings via `update` (with `--deploy-anyway` fallback) |
 | **8** | **Execute Replication Flow** | Triggers execution task via `datasphere tasks replication-flows run` |
 | **9** | **Monitor replication status** | Polls `datasphere tasks replication-flows status` until `COMPLETED` |
 
 > [!TIP]
-> **Why Approach A fixes the Greyed-Out / Draft Issue:**  
-> When `isNew: false` is used, SAP Datasphere binds the replication task to an existing Local Table entity rather than generating an uncommitted draft object on the fly. This completely avoids the *"unsaved target objects"* warning and allows immediate, error-free deployment from CI/CD. The exact table definitions are automatically exported to `reports/local_tables_csn.json` on every run.
+> **Why Embedding Target Definitions in CSN Solves the Issue:**  
+> In SAP Datasphere Data Lake File storage spaces, target entities are Delta Lake datasets on `DWC_HDLF`. By embedding the target entity `definitions` directly at the root of the Replication Flow CSN payload, SAP's CDS Compiler compiles both the Delta Lake target entities and the replication tasks together. Coupled with the mandatory Step 6 second save, this guarantees that target objects are persisted without draft locks or greyed-out states.
 
 ---
 
