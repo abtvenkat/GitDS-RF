@@ -13,14 +13,12 @@ flowchart TD
     C --> D["Checkout & Change Detection (git diff)"]
     D --> E["Authenticate with SAP Datasphere (@sap/datasphere-cli)"]
     E --> F["Validate Source Connection & Space"]
-    F --> G["Create / Update Replication Flows"]
-    G --> H["Deploy Replication Flows"]
-    H --> I["Execute Replication Tasks"]
-    I --> J["Monitor Execution until Completion"]
-    J --> K["Validate Replicated Local Tables"]
-    K --> L["Share Local Tables with Consumer Spaces"]
-    L --> M["Validate Space Sharing"]
-    M --> N["Generate Execution Report & Summary"]
+    F --> G["Stage 1: Save Draft Flow (--no-deploy, isNew: true)"]
+    G --> H["Stage 2: Materialize Target Objects (--no-deploy, isNew: false)"]
+    H --> I["Stage 3: Deploy Replication Flow & Targets"]
+    I --> J["Stage 4: Execute Replication Tasks (tasks run)"]
+    J --> K["Monitor Execution until COMPLETED"]
+    K --> L["Generate Execution Report & GitHub Summary"]
 ```
 
 ---
@@ -33,21 +31,21 @@ Input CDS Views via `cds_views.txt` in the root of the repository:
 # Enter one CDS View technical name per line.
 # Blank lines and lines starting with '#' are ignored.
 
-I_SALESORDER
-I_SALESORDERITEM
-I_CUSTOMER
-I_PRODUCT
+I_BILLINGFREQUENCY
+I_BILLINGFREQUENCY_TEXT
+I_CURRENCYTEXT
 ```
 
 - **Format:** One CDS View name per line.
+- **Consolidation:** All active CDS views are consolidated into a **single Replication Flow** (`RF_CONSOLIDATED` or custom `FLOW_NAME`).
 - **Comments & Blank Lines:** Ignored automatically.
-- **Change Detection:** Only newly added or changed CDS Views are processed in subsequent runs. Existing flows and tables are never deleted when a view is removed.
+- **Change Detection:** Only newly added or changed CDS Views are processed in subsequent runs. Existing flows and targets are preserved.
 
 ---
 
 ## 2. GitHub Secrets & Variables Configuration
 
-Go to your GitHub repository: **Settings** → **Secrets and variables** → **Actions**.
+Configure your GitHub repository: **Settings** → **Secrets and variables** → **Actions**.
 
 ### Required Secrets (Repository Secrets)
 
@@ -63,51 +61,41 @@ Go to your GitHub repository: **Settings** → **Secrets and variables** → **A
 
 | Variable Name | Description | Example | Default |
 | :--- | :--- | :--- | :--- |
-| `SOURCE_SPACE` | Technical ID of the source Datasphere space | `SALES_SPACE` | *(Required)* |
-| `SOURCE_CONNECTION` | Technical ID of the source connection | `S4HANA_CONN` | *(Required)* |
+| `SOURCE_SPACE` | Technical ID of the source Datasphere space | `RAD_S3X` | *(Required)* |
+| `SOURCE_CONNECTION` | Technical ID of the source connection | `S3XReplicationflows` | *(Required)* |
 | `SOURCE_CONTAINER` | Source container/namespace | `CDS_EXTRACTION` | `CDS_EXTRACTION` |
-| `TARGET_CONNECTION` | Target connection technical ID | `DATASPHERE_LOCAL` | `DATASPHERE_LOCAL` |
-| `AUTHORIZATION_FLOW` | OAuth grant type (`client_credentials` or `authorization_code`) | `client_credentials` | `client_credentials` |
-| `CONSUMER_SPACES` | Comma-separated list of target spaces to share local tables | `ANALYTICS_SPACE,FINANCE_SPACE` | *(Optional)* |
+| `TARGET_CONNECTION` | Target connection technical ID | `DWC_HDLF` | `DWC_HDLF` |
+| `FLOW_NAME` | Custom name for the consolidated Replication Flow | `RF_CONSOLIDATED` | `RF_CONSOLIDATED` |
 | `LOAD_TYPE` | Replication load mode (`INITIAL` or `INITIAL_AND_DELTA`) | `INITIAL` | `INITIAL` |
 | `STATUS_TIMEOUT_SEC` | Maximum seconds to wait for flow run completion | `600` | `600` |
 | `STATUS_POLL_INTERVAL_SEC`| Seconds between status checks | `15` | `15` |
 
 ---
 
-## 3. SAP Datasphere OAuth Setup
+## 3. Official 9-Step Technical User Automation Sequence
 
-To generate the OAuth credentials:
-1. Log in to your SAP Datasphere tenant as an Administrator.
-2. In the left navigation, click **System** → **Administration** → **App Integration**.
-3. Under **OAuth Clients**, click **Add a client**.
-4. Set:
-   - **Name:** e.g., `GitHub-Actions-CI`
-   - **Purpose:** Interactive Usage / API
-   - **Redirect URI:** `http://localhost:8080` (standard default)
-5. Save and copy the **Client ID**, **Client Secret**, **Authorization URL**, and **Token URL** into your GitHub Repository Secrets.
+When automating Replication Flow creation with a Datasphere technical user, the automation follows this exact 9-step sequence:
 
----
+| Step | Operation | Implementation Detail |
+| :--- | :--- | :--- |
+| **1** | **Authenticate using Datasphere technical user** | Headless OAuth2 client credentials pre-fetch & `@sap/datasphere-cli login` |
+| **2** | **Create or update Replication Flow** | Checks space for existing technical name & builds consolidated payload |
+| **3** | **Configure source objects** | Maps source CDS view columns, keys, and extraction container |
+| **4** | **Generate target Local Tables** | Defines Delta Lake target structures with CDC `Change_Type` and `Change_Date` |
+| **5** | **Save Replication Flow** | Initial save with `--no-deploy` and `isNew: true` (registers target objects) |
+| **6** | **Save again to persist newly created target objects** | **Critical Step**: Re-saves with `--no-deploy` and `isNew: false` to persist targets |
+| **7** | **Deploy Replication Flow** | Deploys flow and targets via `update` (with `--deploy-anyway` / `--save-anyway`) |
+| **8** | **Execute Replication Flow** | Triggers execution task via `datasphere tasks replication-flows run` |
+| **9** | **Monitor replication status** | Polls `datasphere tasks replication-flows status` until `COMPLETED` |
 
-## 4. Automated Execution Stages
-
-Whenever `cds_views.txt` is committed and pushed to `main`:
-1. **Change Detection:** Determines if any new CDS Views were added since the last commit (`git diff HEAD~1 HEAD`).
-2. **Authentication:** Headless authentication using `@sap/datasphere-cli` with secure temporary credentials.
-3. **Connection Validation:** Confirms that the target source connection exists in the source space.
-4. **Plan Generation:** Formulates technical names and CSN definitions for Replication Flows and target Local Tables (`RF_<VIEW>`, `LT_<VIEW>`).
-5. **Create / Update Flow:** Deploys the flow definition into SAP Datasphere using `datasphere objects replication-flows`.
-6. **Execute:** Triggers task execution with `datasphere tasks replication-flows run`.
-7. **Monitor:** Polls task status until `COMPLETED` (or flags timeout/failure).
-8. **Validate Local Table:** Reads the generated local table definition to verify creation.
-9. **Space Sharing:** Updates local table definitions with `sharing.targetSpaces` and pushes updates to Datasphere.
-10. **Validate Sharing:** Reads back the table definition to confirm the table is shared with the requested consumer spaces.
-11. **Reporting:** Publishes a Markdown summary to GitHub Actions (`$GITHUB_STEP_SUMMARY`) and saves JSON/Markdown reports as artifacts.
+> [!IMPORTANT]
+> **Why Step 6 is essential:**  
+> Successful creation of the Replication Flow (Step 5) registers target objects in draft mode. Datasphere requires the flow to be saved once again (Step 6) to persist the newly created target objects in the repository before they are ready for deployment (Step 7). Skipping Step 6 leaves target objects uncommitted and causes deployment to fail with *"There are unsaved target objects. Please save again"*.
 
 ---
 
-## 5. Manual Execution & Overrides
+## 4. Manual Execution & Overrides
 
-You can also trigger the workflow manually from the **Actions** tab in GitHub:
+You can trigger the workflow manually from the **Actions** tab in GitHub:
 - Click **SAP Datasphere Replication Flows** → **Run workflow**.
 - Check **Force replication of all CDS Views** to bypass git diff and re-replicate all views declared in `cds_views.txt`.
