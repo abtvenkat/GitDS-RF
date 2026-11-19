@@ -438,6 +438,27 @@ class ReplicationOrchestrator:
             json.dump(data, f, indent=2)
         return path
 
+    def _patch_is_new(self, payload: dict, flow_name: str, is_new: bool) -> dict:
+        """
+        Deep-patches every targetObject.metadata.isNew in the server-read payload.
+        This ensures we reuse server-assigned IDs while updating the isNew flag.
+        """
+        import copy
+        patched = copy.deepcopy(payload)
+        try:
+            rf_map = patched.get("replicationflows", {})
+            flow_body = rf_map.get(flow_name, {})
+            tasks = flow_body.get("contents", {}).get("replicationTasks", [])
+            for task in tasks:
+                tgt = task.get("targetObject", {})
+                meta = tgt.get("metadata", {})
+                meta["isNew"] = is_new
+                tgt["metadata"] = meta
+            log("STEP 6", f"Patched isNew={is_new} in {len(tasks)} replication task(s).")
+        except Exception as ex:
+            log("STEP 6", f"Patch warning: {ex}", "WARN")
+        return patched
+
     def _rf_cmd(self, action: str, flow_name: str, file_path: Path, extra: list = None) -> subprocess.CompletedProcess:
         cmd = ["datasphere", "objects", "replication-flows", action,
                "--space", self.source_space,
@@ -511,13 +532,39 @@ class ReplicationOrchestrator:
         time.sleep(5)
 
         # ---------------------------------------------------------------------
-        # STEP 6: Save again to persist newly created target objects (MANDATORY)
+        # STEP 6: Read back server state → patch isNew=False → re-save (MANDATORY)
+        # Datasphere assigns internal IDs to target objects during Step 5.
+        # We MUST read the server-side state and re-save it with isNew=False,
+        # otherwise our locally-built payload conflicts with server-assigned IDs
+        # and targets remain greyed out as uncommitted drafts.
         # ---------------------------------------------------------------------
+        log("STEP 6", f"Reading back Replication Flow '{flow_name}' from Datasphere server to get server-assigned target IDs...")
+        r_read = run_cmd([
+            "datasphere", "objects", "replication-flows", "read",
+            "--space", self.source_space,
+            "--technical-name", flow_name,
+            "--secrets-file", str(self.secrets_path),
+            "--host", self.host
+        ])
+
+        file_step6 = file_existing  # default fallback
+        if r_read.returncode == 0 and r_read.stdout and r_read.stdout.strip().startswith("{"):
+            try:
+                server_payload = json.loads(r_read.stdout)
+                # Patch isNew=False in every targetObject within the server-read payload
+                patched = self._patch_is_new(server_payload, flow_name, is_new=False)
+                file_step6 = self._write_json(f"{flow_name}_step6_patched", patched)
+                log("STEP 6", "Successfully read back server state and patched isNew=False in target objects.")
+            except Exception as ex:
+                log("STEP 6", f"Failed to parse server readback ({ex}). Falling back to locally-built payload.", "WARN")
+        else:
+            log("STEP 6", f"Could not read back flow from server ({r_read.stderr or r_read.stdout}). Falling back to locally-built payload.", "WARN")
+
         log("STEP 6", f"Save again to persist newly created target objects (isNew: false, --no-deploy)...")
-        r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy"])
+        r2 = self._rf_cmd("update", flow_name, file_step6, ["--no-deploy"])
         if r2.returncode != 0:
             log("STEP 6", f"Notice during Step 6: {r2.stderr or r2.stdout}. Retrying with --save-anyway...", "WARN")
-            r2 = self._rf_cmd("update", flow_name, file_existing, ["--no-deploy", "--save-anyway"])
+            r2 = self._rf_cmd("update", flow_name, file_step6, ["--no-deploy", "--save-anyway"])
             if r2.returncode != 0:
                 # CRITICAL: Step 6 is mandatory. If persistence fails, do NOT proceed to deployment!
                 self.step_status["step6"] = "FAILED"
@@ -528,6 +575,9 @@ class ReplicationOrchestrator:
         self.step_status["step6"] = "PASSED"
         log("STEP 6", f"Replication Flow '{flow_name}' saved again. Newly created target objects are now persisted.")
         time.sleep(5)
+
+        # Also update file_existing to use the patched server payload for deployment
+        file_existing = file_step6
 
         # ---------------------------------------------------------------------
         # STEP 7: Deploy Replication Flow
