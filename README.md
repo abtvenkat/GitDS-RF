@@ -13,12 +13,12 @@ flowchart TD
     C --> D["Checkout & Change Detection (git diff)"]
     D --> E["Authenticate with SAP Datasphere (@sap/datasphere-cli)"]
     E --> F["Validate Source Connection & Space"]
-    F --> G["Stage 1: Save Draft Flow (--no-deploy, isNew: true)"]
-    G --> H["Stage 2: Materialize Target Objects (--no-deploy, isNew: false)"]
-    H --> I["Stage 3: Deploy Replication Flow & Targets"]
-    I --> J["Stage 4: Execute Replication Tasks (tasks run)"]
+    F --> G["Map Target to Existing Local Tables (isNew: false)"]
+    G --> H["Save Replication Flow (--no-deploy)"]
+    H --> I["Deploy Replication Flow (update)"]
+    I --> J["Execute Replication Flow (tasks run)"]
     J --> K["Monitor Execution until COMPLETED"]
-    K --> L["Generate Execution Report & GitHub Summary"]
+    K --> L["Generate Execution Report & CSN Artifacts"]
 ```
 
 ---
@@ -72,25 +72,25 @@ Configure your GitHub repository: **Settings** → **Secrets and variables** →
 
 ---
 
-## 3. Official 9-Step Technical User Automation Sequence
+## 3. Official 9-Step Automation Sequence (Approach A: Existing Target Mapping)
 
-When automating Replication Flow creation with a Datasphere technical user, the automation follows this exact 9-step sequence:
+To guarantee 100% deployment reliability and avoid SAP's backend draft-locking bug (*"There are unsaved target objects. Please save again"*), the pipeline maps target objects directly as existing Local Tables (`isNew: false`):
 
 | Step | Operation | Implementation Detail |
 | :--- | :--- | :--- |
 | **1** | **Authenticate using Datasphere technical user** | Headless OAuth2 client credentials pre-fetch & `@sap/datasphere-cli login` |
 | **2** | **Create or update Replication Flow** | Checks space for existing technical name & builds consolidated payload |
 | **3** | **Configure source objects** | Maps source CDS view columns, keys, and extraction container |
-| **4** | **Generate target Local Tables** | Defines Delta Lake target structures with CDC `Change_Type` and `Change_Date` |
-| **5** | **Save Replication Flow** | Initial save with `--no-deploy` and `isNew: true` (registers target objects) |
-| **6** | **Save again to persist newly created target objects** | **Critical Step**: Re-saves with `--no-deploy` and `isNew: false` to persist targets |
-| **7** | **Deploy Replication Flow** | Deploys flow and targets via `update` (with `--deploy-anyway` / `--save-anyway`) |
+| **4** | **Map target Local Tables (`isNew: false`)** | Sets `isNew: false` referencing target tables; exports `reports/local_tables_csn.json` |
+| **5** | **Save Replication Flow** | Saves flow draft with `--no-deploy` (clean registration without draft locks) |
+| **6** | **Validate target persistence** | Confirms target tables are mapped as existing persisted objects |
+| **7** | **Deploy Replication Flow** | Deploys flow and active bindings via `update` (with `--deploy-anyway` fallback) |
 | **8** | **Execute Replication Flow** | Triggers execution task via `datasphere tasks replication-flows run` |
 | **9** | **Monitor replication status** | Polls `datasphere tasks replication-flows status` until `COMPLETED` |
 
-> [!IMPORTANT]
-> **Why Step 6 is essential:**  
-> Successful creation of the Replication Flow (Step 5) registers target objects in draft mode. Datasphere requires the flow to be saved once again (Step 6) to persist the newly created target objects in the repository before they are ready for deployment (Step 7). Skipping Step 6 leaves target objects uncommitted and causes deployment to fail with *"There are unsaved target objects. Please save again"*.
+> [!TIP]
+> **Why Approach A fixes the Greyed-Out / Draft Issue:**  
+> When `isNew: false` is used, SAP Datasphere binds the replication task to an existing Local Table entity rather than generating an uncommitted draft object on the fly. This completely avoids the *"unsaved target objects"* warning and allows immediate, error-free deployment from CI/CD. The exact table definitions are automatically exported to `reports/local_tables_csn.json` on every run.
 
 ---
 
