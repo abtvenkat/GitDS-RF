@@ -431,18 +431,16 @@ class ReplicationOrchestrator:
         self.build_definitions(views)
         return self.report_dir / "local_tables_csn.json"
 
-    def build_consolidated_flow_json(self, flow_name: str, views: list) -> dict:
+    def build_consolidated_flow_json(self, flow_name: str, views: list, is_new: bool = True) -> dict:
         """
-        Builds a SINGLE Replication Flow CSN JSON containing:
-        1. Root '$version', 'version', and 'meta'
-        2. Root 'definitions' containing Delta Lake entity definitions for HDL_FILES
-        3. 'replicationflows' with all CDS Views mapped to their Delta Lake targets
+        Builds a SINGLE Replication Flow JSON containing all CDS Views as separate replication tasks.
+        Step 3: Configures source objects.
+        Step 4: Generates target objects in Data Lake Files (HDL_FILES / DWC_HDLF).
         """
         target_conn_id = self.target_conn if self.target_conn not in ("DATASPHERE_LOCAL", "", None) else "DWC_HDLF"
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
         source_container = f"/{self.source_container.lstrip('/')}"
-
-        definitions = self.build_definitions(views)
+        target_container = os.getenv("TARGET_CONTAINER", "").strip() or (f"/{self.source_space.lstrip('/')}" if target_conn_type == "HDL_FILES" else "")
 
         all_cols = []
         replication_tasks = []
@@ -469,7 +467,7 @@ class ReplicationOrchestrator:
                 "targetObject": {
                     "name": table_name,
                     "definition": {"columns": target_cols, "keys": keys},
-                    "metadata": {"isNew": False},  # Bound to definitions embedded in the CSN document
+                    "metadata": {"isNew": is_new},  # True on initial creation so Datasphere generates targets
                     "properties": {
                         "com.sap.datasuite.cdc.mode.column": "Change_Type",
                         "com.sap.datasuite.cdc.timestamp.column": "Change_Date",
@@ -499,7 +497,7 @@ class ReplicationOrchestrator:
                 "targetSystem": [{
                     "connectionId": target_conn_id,
                     "connectionType": target_conn_type,
-                    "container": "",
+                    "container": target_container,
                     "maxConnections": 10,
                     "isGeneric": False,
                     "metadata": {"connectionMetaschema": {"sources": ["SAP"]}},
@@ -528,13 +526,7 @@ class ReplicationOrchestrator:
             "connections": {self.source_conn: {}}
         }
 
-        return {
-            "$version": "1.0",
-            "version": {"csn": "1.0"},
-            "meta": {"creator": "CDS Compiler v1.19.2"},
-            "definitions": definitions,
-            "replicationflows": {flow_name: flow_body}
-        }
+        return {"replicationflows": {flow_name: flow_body}}
 
     def _write_json(self, name: str, data: dict) -> Path:
         path = Path(self.temp_dir.name) / f"{name}.json"
@@ -606,7 +598,8 @@ class ReplicationOrchestrator:
 
         # Step 4: Generate target Delta Lake definitions & build consolidated payload
         log("STEP 4", f"Generating target Delta Lake definitions (CSN) for {len(views)} views in HDL_FILES space...")
-        payload = self.build_consolidated_flow_json(flow_name, views)
+        self.generate_local_tables_csn(views)
+        payload = self.build_consolidated_flow_json(flow_name, views, is_new=True)
         flow_file = self._write_json(f"{flow_name}_consolidated", payload)
         self.step_status["step4"] = "PASSED"
 
@@ -640,6 +633,24 @@ class ReplicationOrchestrator:
         if r2.returncode != 0:
             log("STEP 6", f"Notice during Step 6: {r2.stderr or r2.stdout}. Retrying with --save-anyway...", "WARN")
             r2 = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy", "--save-anyway"])
+
+        if r2.returncode != 0:
+            log("STEP 6", "Direct second save returned notice. Fetching server state to persist target objects...", "WARN")
+            read_res = run_cmd(["datasphere", "objects", "replication-flows", "read",
+                                "--space", self.source_space,
+                                "--technical-name", flow_name,
+                                "--secrets-file", str(self.secrets_path),
+                                "--host", self.host])
+            if read_res.returncode == 0 and read_res.stdout:
+                try:
+                    server_payload = json.loads(read_res.stdout)
+                    patched = self._patch_is_new(server_payload, flow_name, is_new=False)
+                    file_step6 = self._write_json(f"{flow_name}_step6", patched)
+                    r2 = self._rf_cmd("update", flow_name, file_step6, ["--no-deploy", "--save-anyway"])
+                    if r2.returncode == 0:
+                        flow_file = file_step6
+                except Exception as ex:
+                    log("STEP 6", f"Server payload patch notice: {ex}", "WARN")
 
         if r2.returncode != 0:
             self.step_status["step6"] = "FAILED"
@@ -762,7 +773,7 @@ class ReplicationOrchestrator:
             f"1. {badge('step1')} Authenticate using Datasphere technical user",
             f"2. {badge('step2')} Create or update Replication Flow",
             f"3. {badge('step3')} Configure source objects",
-            f"4. {badge('step4')} Generate target Delta Lake definitions (CSN embedded)",
+            f"4. {badge('step4')} Generate target Delta Lake definitions & configure flow",
             f"5. {badge('step5')} Save Replication Flow draft (--no-deploy)",
             f"6. {badge('step6')} Save again to persist target objects (Mandatory validation)",
             f"7. {badge('step7')} Deploy Replication Flow",

@@ -91,16 +91,16 @@ To guarantee 100% deployment reliability and target entity persistence in Data L
 | **1** | **Authenticate using Datasphere technical user** | Headless OAuth2 client credentials pre-fetch & `@sap/datasphere-cli login` |
 | **2** | **Create or update Replication Flow** | Checks space for existing technical name & initializes consolidated flow |
 | **3** | **Configure source objects** | Maps source CDS view columns, keys, and extraction container |
-| **4** | **Generate target Delta Lake definitions (CSN)** | Embeds full Delta Lake entity definitions (`DELTA_LAKE` format, CDC annotations) directly into CSN |
-| **5** | **Save Replication Flow draft** | Saves flow draft with `--no-deploy` to register replication tasks and target bindings |
-| **6** | **Save again to persist target objects (Mandatory)** | Executes mandatory second save to validate target persistence; fails if unpersisted |
+| **4** | **Configure target Delta Lake objects** | Configures Delta Lake targets (`isNew: true`) in container `/<space_name>` |
+| **5** | **Save Replication Flow draft** | Initial save with `--no-deploy` to create flow and register target objects |
+| **6** | **Save again to persist target objects (Mandatory)** | Mandatory second save (`--no-deploy`) to commit & persist newly created target objects |
 | **7** | **Deploy Replication Flow** | Deploys flow and active bindings via `update` (with `--deploy-anyway` fallback) |
 | **8** | **Execute Replication Flow** | Triggers execution task via `datasphere tasks replication-flows run` |
 | **9** | **Monitor replication status** | Polls `datasphere tasks replication-flows status` until `COMPLETED` |
 
 > [!TIP]
-> **Why Embedding Target Definitions in CSN Solves the Issue:**  
-> In SAP Datasphere Data Lake File storage spaces, target entities are Delta Lake datasets on `DWC_HDLF`. By embedding the target entity `definitions` directly at the root of the Replication Flow CSN payload, SAP's CDS Compiler compiles both the Delta Lake target entities and the replication tasks together. Coupled with the mandatory Step 6 second save, this guarantees that target objects are persisted without draft locks or greyed-out states.
+> **Why the Two-Stage Save (Step 5 & Step 6) is Mandatory for Target Persistence:**  
+> In SAP Datasphere, target objects are created in draft mode during the initial save (Step 5). As stated in SAP's official notice: *"Now the objects are already created when the replication flow is saved. You need to save the replication flow once again before deploying it so that the new objects are included correctly."* Saving the flow a second time (Step 6) commits the newly created target objects so they are fully persisted in the Data Lake Files container before deployment.
 
 ---
 
