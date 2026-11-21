@@ -19,7 +19,7 @@ flowchart TD
     I --> J["Deploy Replication Flow (update)"]
     J --> K["Execute Replication Flow (tasks run)"]
     K --> L["Monitor Execution until COMPLETED"]
-    L --> M["Step 10: Dedicated Cross-Space Sharing to CONSUMER_SPACES"]
+    L --> M["Step 10: Target Verification & Consumer Space Readiness"]
     M --> N["Generate Execution Report & CSN Artifacts"]
 ```
 
@@ -101,7 +101,13 @@ To guarantee 100% deployment reliability, target entity persistence, and cross-s
 | **7** | **Deploy Replication Flow** | Deploys flow and active bindings via `update` (with `--deploy-anyway` fallback) |
 | **8** | **Execute Replication Flow** | Triggers execution task via `datasphere tasks replication-flows run` |
 | **9** | **Monitor replication status** | Polls `datasphere tasks replication-flows status` until `COMPLETED` |
-| **10** | **Share Local Tables to Consumer Space(s)** | Dedicated sharing step: reads live deployed CSN from Datasphere, injects cross-space sharing for `CONSUMER_SPACES`, applies update, and verifies server persistence |
+| **10** | **Verify target Local Tables & Consumer Space Readiness** | Dedicated verification step: validates target Local Tables are active in source space, records consumer space readiness (`CONSUMER_SPACES`), and logs access governance |
+
+> [!NOTE]
+> **Cross-Space Table Sharing in SAP Datasphere:**  
+> In SAP Datasphere, cross-space sharing is an **access control authorization rule** managed at the platform security layer (via the **Share Local Table** modal in the Datasphere UI). It is not an attribute of the table's CSN schema.
+> - **Permanent Link:** Once a Local Table in `RAD_S3X` is shared to `RADH_S3X` in the UI (as shown in the Datasphere sharing dialog), that access grant remains permanent.
+> - **Continuous Automated Updates:** Every subsequent CI/CD run automatically replicates fresh data directly into the table. The consumer space (`RADH_S3X`) immediately accesses all new data in real time without requiring re-sharing or manual intervention.
 
 > [!TIP]
 > **Why the Two-Stage Save (Step 5 & Step 6) is Mandatory for Target Persistence:**  
