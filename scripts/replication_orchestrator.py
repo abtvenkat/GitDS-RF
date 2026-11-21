@@ -534,6 +534,11 @@ class ReplicationOrchestrator:
                     }
                 }
             }
+            if self.consumer_spaces:
+                definitions[table_name]["sharing"] = {
+                    "LocalTable": [{"targetSpaces": self.consumer_spaces}],
+                    table_name: [{"targetSpaces": self.consumer_spaces}]
+                }
 
             # 2. Delta entity: <TABLE_NAME>_Delta
             definitions[delta_table_name] = {
@@ -584,6 +589,11 @@ class ReplicationOrchestrator:
                     }
                 }
             }
+            if self.consumer_spaces:
+                definitions[delta_table_name]["sharing"] = {
+                    "LocalTable": [{"targetSpaces": self.consumer_spaces}],
+                    delta_table_name: [{"targetSpaces": self.consumer_spaces}]
+                }
 
         csn_payload = {
             "$version": "1.0",
@@ -592,7 +602,9 @@ class ReplicationOrchestrator:
             "definitions": definitions
         }
         if self.consumer_spaces:
-            sharing = {}
+            sharing = {
+                "LocalTable": [{"targetSpaces": self.consumer_spaces}]
+            }
             for view in views:
                 tname = f"{self.table_prefix}{view}" if self.table_prefix else view
                 dname = f"{tname}_Delta"
@@ -637,6 +649,7 @@ class ReplicationOrchestrator:
             }
             if self.consumer_spaces:
                 table_csn["sharing"] = {
+                    "LocalTable": [{"targetSpaces": self.consumer_spaces}],
                     table_name: [{"targetSpaces": self.consumer_spaces}],
                     delta_table_name: [{"targetSpaces": self.consumer_spaces}]
                 }
@@ -682,14 +695,20 @@ class ReplicationOrchestrator:
             if r_table.returncode == 0:
                 share_info = f" and shared to space(s) '{', '.join(self.consumer_spaces)}'" if self.consumer_spaces else ""
                 log("STEP 4", f"Local Table '{table_name}' and '{delta_table_name}' successfully deployed to space '{self.source_space}'{share_info}.")
-                if not exists and self.consumer_spaces:
-                    log("STEP 4", f"Ensuring sharing permissions are active for '{table_name}' in {', '.join(self.consumer_spaces)}...")
-                    run_cmd(["datasphere", "objects", "local-tables", "update",
-                             "--space", self.source_space,
-                             "--technical-name", table_name,
-                             "--file-path", str(table_csn_path),
-                             "--secrets-file", str(self.secrets_path),
-                             "--host", self.host])
+                if self.consumer_spaces:
+                    log("STEP 4", f"Checking deployed sharing configuration on server for '{table_name}'...")
+                    r_verify = run_cmd(["datasphere", "objects", "local-tables", "read",
+                                       "--space", self.source_space,
+                                       "--technical-name", table_name,
+                                       "--secrets-file", str(self.secrets_path),
+                                       "--host", self.host])
+                    if r_verify.returncode == 0 and r_verify.stdout:
+                        try:
+                            s_data = json.loads(r_verify.stdout)
+                            s_sharing = s_data.get("sharing") or s_data.get("definitions", {}).get(table_name, {}).get("sharing")
+                            log("STEP 4", f"Server sharing status for '{table_name}': {json.dumps(s_sharing) if s_sharing else 'No sharing block in server read response'}")
+                        except Exception:
+                            pass
             else:
                 log("STEP 4", f"Notice while deploying Local Table '{table_name}': {r_table.stderr or r_table.stdout}. Proceeding with flow creation...", "WARN")
 
