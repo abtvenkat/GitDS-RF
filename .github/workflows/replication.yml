@@ -15,6 +15,11 @@ on:
         required: false
         type: boolean
         default: false
+      consumer_space:
+        description: 'Consumer Space(s) to share the created Local Tables to (comma-separated for multiple)'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: datasphere-replication-${{ github.ref }}
@@ -55,6 +60,7 @@ jobs:
           TOKEN_URL: ${{ secrets.TOKEN_URL }}
           AUTHORIZATION_FLOW: ${{ vars.AUTHORIZATION_FLOW || 'client_credentials' }}
           SOURCE_SPACE: ${{ vars.SOURCE_SPACE || secrets.SOURCE_SPACE }}
+          CONSUMER_SPACE: ${{ github.event.inputs.consumer_space || vars.CONSUMER_SPACE || vars.TARGET_SPACE || secrets.CONSUMER_SPACE || secrets.TARGET_SPACE || '' }}
           SOURCE_CONNECTION: ${{ vars.SOURCE_CONNECTION || secrets.SOURCE_CONNECTION }}
           SOURCE_CONTAINER: ${{ vars.SOURCE_CONTAINER || secrets.SOURCE_CONTAINER || 'CDS_EXTRACTION' }}
           TARGET_CONNECTION: ${{ vars.TARGET_CONNECTION || secrets.TARGET_CONNECTION || 'DWC_HDLF' }}

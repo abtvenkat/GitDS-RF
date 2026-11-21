@@ -71,6 +71,8 @@ class ReplicationOrchestrator:
         self.flow_prefix = os.getenv("FLOW_PREFIX", "RF_").strip()
         self.table_prefix = os.getenv("TABLE_PREFIX", "").strip()
         self.custom_flow_name = os.getenv("FLOW_NAME", "").strip() or os.getenv("REPLICATION_FLOW_NAME", "").strip()
+        raw_consumer = os.getenv("CONSUMER_SPACE", "").strip() or os.getenv("TARGET_SPACE", "").strip()
+        self.consumer_spaces = [s.strip() for s in raw_consumer.split(",") if s.strip()]
 
         self.poll_interval = int(os.getenv("STATUS_POLL_INTERVAL_SEC", "15"))
         self.timeout_sec = int(os.getenv("STATUS_TIMEOUT_SEC", "600"))
@@ -118,6 +120,10 @@ class ReplicationOrchestrator:
             self.host = f"https://{self.host}"
         log("INIT", f"Target Host: {self.host}")
         log("INIT", f"Source Space: {self.source_space}")
+        if self.consumer_spaces:
+            log("INIT", f"Consumer Space(s) for Sharing: {', '.join(self.consumer_spaces)}")
+        else:
+            log("INIT", "Consumer Space: None (Tables will remain local to source space)")
         log("INIT", f"Source Connection: {self.source_conn}")
         log("INIT", f"Source Container: {self.source_container}")
         log("INIT", f"Load Type: {self.load_type}")
@@ -580,10 +586,20 @@ class ReplicationOrchestrator:
             "meta": {"creator": "CDS Compiler v1.19.2"},
             "definitions": definitions
         }
+        if self.consumer_spaces:
+            sharing = {}
+            for view in views:
+                tname = f"{self.table_prefix}{view}" if self.table_prefix else view
+                dname = f"{tname}_Delta"
+                sharing[tname] = [{"targetSpaces": self.consumer_spaces}]
+                sharing[dname] = [{"targetSpaces": self.consumer_spaces}]
+            csn_payload["sharing"] = sharing
+
         csn_path = self.report_dir / "local_tables_csn.json"
         with open(csn_path, "w", encoding="utf-8") as f:
             json.dump(csn_payload, f, indent=2)
-        log("TABLES", f"Generated target definitions CSN at '{csn_path}'.")
+        share_msg = f" (Configured sharing to: {', '.join(self.consumer_spaces)})" if self.consumer_spaces else ""
+        log("TABLES", f"Generated target definitions CSN at '{csn_path}'{share_msg}.")
         return definitions
 
     def generate_local_tables_csn(self, views: list) -> Path:
@@ -595,6 +611,8 @@ class ReplicationOrchestrator:
         """
         Step 4: Generates target Local Table Delta Lake definitions (CSN) and deploys
         them into the SAP Datasphere space via `datasphere objects local-tables create/update`.
+        If consumer spaces are specified via CONSUMER_SPACE, automatically configures
+        cross-space sharing for both the active and delta entities.
         """
         definitions = self.build_definitions(views)
         all_success = True
@@ -612,6 +630,13 @@ class ReplicationOrchestrator:
                     delta_table_name: definitions[delta_table_name]
                 }
             }
+            if self.consumer_spaces:
+                table_csn["sharing"] = {
+                    table_name: [{"targetSpaces": self.consumer_spaces}],
+                    delta_table_name: [{"targetSpaces": self.consumer_spaces}]
+                }
+                log("STEP 4", f"Sharing Local Table '{table_name}' and '{delta_table_name}' to consumer space(s): {', '.join(self.consumer_spaces)}")
+
             table_csn_path = self._write_json(f"{table_name}_csn", table_csn)
 
             log("STEP 4", f"Checking if Local Table '{table_name}' exists in space '{self.source_space}'...")
@@ -650,7 +675,16 @@ class ReplicationOrchestrator:
                                    "--save-anyway"])
 
             if r_table.returncode == 0:
-                log("STEP 4", f"Local Table '{table_name}' and '{delta_table_name}' successfully deployed to space '{self.source_space}'.")
+                share_info = f" and shared to space(s) '{', '.join(self.consumer_spaces)}'" if self.consumer_spaces else ""
+                log("STEP 4", f"Local Table '{table_name}' and '{delta_table_name}' successfully deployed to space '{self.source_space}'{share_info}.")
+                if not exists and self.consumer_spaces:
+                    log("STEP 4", f"Ensuring sharing permissions are active for '{table_name}' in {', '.join(self.consumer_spaces)}...")
+                    run_cmd(["datasphere", "objects", "local-tables", "update",
+                             "--space", self.source_space,
+                             "--technical-name", table_name,
+                             "--file-path", str(table_csn_path),
+                             "--secrets-file", str(self.secrets_path),
+                             "--host", self.host])
             else:
                 log("STEP 4", f"Notice while deploying Local Table '{table_name}': {r_table.stderr or r_table.stdout}. Proceeding with flow creation...", "WARN")
 
@@ -1016,11 +1050,13 @@ class ReplicationOrchestrator:
             else:
                 return "`[NOT_RUN]`"
 
+        consumer_info = ", ".join(self.consumer_spaces) if self.consumer_spaces else "None (Local to source space)"
         lines = [
             "# SAP Datasphere Replication Flow Execution Report",
             f"**Execution Timestamp:** {timestamp}  ",
             f"**Replication Flow:** `{self.flow_name}`  ",
             f"**Source Space:** `{self.source_space}`  ",
+            f"**Consumer Space(s):** `{consumer_info}`  ",
             f"**Source Connection:** `{self.source_conn}`  ",
             f"**Status:** `{flow_status}`  ",
             "",
@@ -1028,21 +1064,21 @@ class ReplicationOrchestrator:
             f"1. {badge('step1')} Authenticate using Datasphere technical user",
             f"2. {badge('step2')} Create or update Replication Flow",
             f"3. {badge('step3')} Configure source objects",
-            f"4. {badge('step4')} Generate target Local Tables (CSN) & deploy in space",
+            f"4. {badge('step4')} Generate target Local Tables (CSN) & deploy/share in space",
             f"5. {badge('step5')} Save Replication Flow draft (--no-deploy)",
             f"6. {badge('step6')} Save again to persist target objects (Mandatory validation)",
             f"7. {badge('step7')} Deploy Replication Flow",
             f"8. {badge('step8')} Execute Replication Flow",
             f"9. {badge('step9')} Monitor replication status ({flow_status})",
             "",
-            "| CDS View | Replication Flow | Target Object | Load Type | Status |",
-            "| :--- | :--- | :--- | :--- | :--- |"
+            "| CDS View | Replication Flow | Target Object | Consumer Space | Load Type | Status |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |"
         ]
 
         for view in views:
             table_name = f"{self.table_prefix}{view}" if self.table_prefix else view
             delta_table_name = f"{table_name}_Delta"
-            lines.append(f"| `{view}` | `{self.flow_name}` | `{delta_table_name}` | `{self.load_type}` | `{flow_status}` |")
+            lines.append(f"| `{view}` | `{self.flow_name}` | `{delta_table_name}` | `{consumer_info}` | `{self.load_type}` | `{flow_status}` |")
 
         report_md = "\n".join(lines)
         report_md_path = self.report_dir / "replication_report.md"

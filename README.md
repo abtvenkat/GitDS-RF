@@ -74,6 +74,7 @@ Configure your GitHub repository: **Settings** → **Secrets and variables** →
 | Variable Name | Description | Example | Default |
 | :--- | :--- | :--- | :--- |
 | `SOURCE_SPACE` | Technical ID of the source Datasphere space | `RAD_S3X` | *(Required)* |
+| `CONSUMER_SPACE` | Technical ID of consumer space(s) to share tables to (comma-separated for multiple) | `RAD_CONSUMER` | `""` (Local to source space) |
 | `SOURCE_CONNECTION` | Technical ID of the source connection | `S3XReplicationflows` | *(Required)* |
 | `SOURCE_CONTAINER` | Source container/namespace | `CDS_EXTRACTION` | `CDS_EXTRACTION` |
 | `TARGET_CONNECTION` | Target connection technical ID | `DWC_HDLF` | `DWC_HDLF` |
@@ -93,7 +94,7 @@ To guarantee 100% deployment reliability and target entity persistence in Data L
 | **1** | **Authenticate using Datasphere technical user** | Headless OAuth2 client credentials pre-fetch & `@sap/datasphere-cli login` |
 | **2** | **Create or update Replication Flow** | Checks space for existing technical name & initializes consolidated flow |
 | **3** | **Configure source objects** | Maps source CDS view columns, keys, and extraction container |
-| **4** | **Deploy target Local Tables (CSN)** | Generates and deploys Delta Lake Local Tables (`<VIEW>` and `<VIEW>_Delta`) with parsed source metadata into Datasphere space |
+| **4** | **Deploy & Share target Local Tables (CSN)** | Generates and deploys Delta Lake Local Tables (`<VIEW>` and `<VIEW>_Delta`) with parsed source metadata, and automatically shares them with `CONSUMER_SPACE` |
 | **5** | **Save Replication Flow draft** | Binds flow tasks to target objects (`<VIEW>_Delta`, `isNew: false`) with `--no-deploy` |
 | **6** | **Save again to persist target objects (Mandatory)** | Mandatory second save (`--no-deploy`) with server-read fallback to validate target persistence |
 | **7** | **Deploy Replication Flow** | Deploys flow and active bindings via `update` (with `--deploy-anyway` fallback) |
