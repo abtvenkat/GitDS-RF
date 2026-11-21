@@ -1071,19 +1071,28 @@ class ReplicationOrchestrator:
         mechanism (mirroring the UI 'Share Local Table' dialog) using the OAuth access token.
         """
         if not self.access_token or not self.consumer_spaces:
+            log("SHARE_API", f"Missing access token (present: {bool(self.access_token)}) or consumer spaces ({self.consumer_spaces}).")
             return False
 
+        log("SHARE_API", f"Attempting direct REST API sharing for table '{table_name}' to space(s): {', '.join(self.consumer_spaces)}...")
+
         endpoints = [
-            f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/localtables/{table_name}/shares",
-            f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/shares",
-            f"{self.host}/api/v1/datasphere/spaces/{self.source_space}/localtables/{table_name}/shares",
-            f"{self.host}/api/v1/datasphere/spaces/{self.source_space}/shares"
+            (f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/localtables/{table_name}/shares", "POST"),
+            (f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/localtables/{table_name}/sharing", "PUT"),
+            (f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/shares", "POST"),
+            (f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/datasets/{table_name}/shares", "POST"),
+            (f"{self.host}/dwaas-core/api/v1/repository/spaces/{self.source_space}/objects/{table_name}/shares", "POST"),
+            (f"{self.host}/api/v1/datasphere/spaces/{self.source_space}/localtables/{table_name}/shares", "POST"),
+            (f"{self.host}/api/v1/datasphere/spaces/{self.source_space}/shares", "POST"),
+            (f"{self.host}/api/v1/dwc/spaces/{self.source_space}/localtables/{table_name}/share", "POST"),
         ]
 
         payloads = [
             {"targetSpaces": self.consumer_spaces, "access": "Read"},
             {"spaces": self.consumer_spaces, "access": "Read"},
-            {"space": self.consumer_spaces[0], "access": "Read"} if len(self.consumer_spaces) == 1 else {"spaces": self.consumer_spaces}
+            {"spaces": [{"name": s, "access": "Read"} for s in self.consumer_spaces]},
+            {"targetSpace": self.consumer_spaces[0], "access": "Read"} if len(self.consumer_spaces) == 1 else {"targetSpaces": self.consumer_spaces},
+            {"objectName": table_name, "objectType": "LOCAL_TABLE", "targetSpaces": self.consumer_spaces, "access": "Read"}
         ]
 
         headers = {
@@ -1102,25 +1111,34 @@ class ReplicationOrchestrator:
                 cookies = r.headers.get_all("set-cookie") or []
                 if csrf_token and csrf_token.lower() != "required":
                     headers["x-csrf-token"] = csrf_token
+                    log("SHARE_API", "Acquired CSRF token from Datasphere server.")
                 if cookies:
                     headers["Cookie"] = "; ".join([c.split(";")[0] for c in cookies])
-        except Exception:
-            pass
+        except Exception as ex:
+            log("SHARE_API", f"CSRF token fetch notice: {ex}")
 
-        for ep in endpoints:
+        for ep, method in endpoints:
             for p in payloads:
                 try:
                     data = json.dumps(p).encode("utf-8")
-                    req = urllib.request.Request(ep, data=data, method="POST", headers=headers)
+                    req = urllib.request.Request(ep, data=data, method=method, headers=headers)
                     with urllib.request.urlopen(req, timeout=10) as res:
                         if res.status in (200, 201, 204):
-                            log("SHARE_API", f"Successfully shared '{table_name}' via API endpoint: {ep}")
+                            log("SHARE_API", f"SUCCESS: Shared '{table_name}' via API: {method} {ep}")
                             return True
-                except urllib.error.HTTPError:
+                except urllib.error.HTTPError as he:
+                    err_msg = ""
+                    try:
+                        err_msg = he.read().decode('utf-8')[:120]
+                    except Exception:
+                        pass
+                    if he.code != 404:
+                        log("SHARE_API", f"Notice from {method} {ep}: HTTP {he.code} - {err_msg}")
                     continue
                 except Exception:
                     continue
 
+        log("SHARE_API", f"Direct REST API share probes completed for '{table_name}'.")
         return False
 
     # -------------------------------------------------------------------------
