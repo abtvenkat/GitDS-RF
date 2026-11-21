@@ -71,7 +71,12 @@ class ReplicationOrchestrator:
         self.flow_prefix = os.getenv("FLOW_PREFIX", "RF_").strip()
         self.table_prefix = os.getenv("TABLE_PREFIX", "").strip()
         self.custom_flow_name = os.getenv("FLOW_NAME", "").strip() or os.getenv("REPLICATION_FLOW_NAME", "").strip()
-        raw_consumer = os.getenv("CONSUMER_SPACE", "").strip() or os.getenv("TARGET_SPACE", "").strip()
+        raw_consumer = (
+            os.getenv("CONSUMER_SPACES", "").strip()
+            or os.getenv("CONSUMER_SPACE", "").strip()
+            or os.getenv("TARGET_SPACES", "").strip()
+            or os.getenv("TARGET_SPACE", "").strip()
+        )
         self.consumer_spaces = [s.strip() for s in raw_consumer.split(",") if s.strip()]
 
         self.poll_interval = int(os.getenv("STATUS_POLL_INTERVAL_SEC", "15"))

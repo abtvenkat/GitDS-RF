@@ -74,7 +74,7 @@ Configure your GitHub repository: **Settings** → **Secrets and variables** →
 | Variable Name | Description | Example | Default |
 | :--- | :--- | :--- | :--- |
 | `SOURCE_SPACE` | Technical ID of the source Datasphere space | `RAD_S3X` | *(Required)* |
-| `CONSUMER_SPACE` | Technical ID of consumer space(s) to share tables to (comma-separated for multiple) | `RAD_CONSUMER` | `""` (Local to source space) |
+| `CONSUMER_SPACES` / `CONSUMER_SPACE` | Technical ID of consumer space(s) to share tables to (comma-separated for multiple) | `RADH_S3X` | `""` (Local to source space) |
 | `SOURCE_CONNECTION` | Technical ID of the source connection | `S3XReplicationflows` | *(Required)* |
 | `SOURCE_CONTAINER` | Source container/namespace | `CDS_EXTRACTION` | `CDS_EXTRACTION` |
 | `TARGET_CONNECTION` | Target connection technical ID | `DWC_HDLF` | `DWC_HDLF` |

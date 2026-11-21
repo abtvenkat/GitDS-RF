@@ -60,7 +60,8 @@ jobs:
           TOKEN_URL: ${{ secrets.TOKEN_URL }}
           AUTHORIZATION_FLOW: ${{ vars.AUTHORIZATION_FLOW || 'client_credentials' }}
           SOURCE_SPACE: ${{ vars.SOURCE_SPACE || secrets.SOURCE_SPACE }}
-          CONSUMER_SPACE: ${{ github.event.inputs.consumer_space || vars.CONSUMER_SPACE || vars.TARGET_SPACE || secrets.CONSUMER_SPACE || secrets.TARGET_SPACE || '' }}
+          CONSUMER_SPACES: ${{ github.event.inputs.consumer_space || vars.CONSUMER_SPACES || vars.CONSUMER_SPACE || vars.TARGET_SPACES || vars.TARGET_SPACE || secrets.CONSUMER_SPACES || secrets.CONSUMER_SPACE || '' }}
+          CONSUMER_SPACE: ${{ github.event.inputs.consumer_space || vars.CONSUMER_SPACES || vars.CONSUMER_SPACE || vars.TARGET_SPACES || vars.TARGET_SPACE || secrets.CONSUMER_SPACES || secrets.CONSUMER_SPACE || '' }}
           SOURCE_CONNECTION: ${{ vars.SOURCE_CONNECTION || secrets.SOURCE_CONNECTION }}
           SOURCE_CONTAINER: ${{ vars.SOURCE_CONTAINER || secrets.SOURCE_CONTAINER || 'CDS_EXTRACTION' }}
           TARGET_CONNECTION: ${{ vars.TARGET_CONNECTION || secrets.TARGET_CONNECTION || 'DWC_HDLF' }}
