@@ -1065,6 +1065,64 @@ class ReplicationOrchestrator:
         log("STEP 9", f"Replication Flow '{flow_name}' monitoring timed out after {self.timeout_sec}s.", "WARN")
         return f"TIMEOUT ({last_status})"
 
+    def _api_share_table(self, table_name: str) -> bool:
+        """
+        Attempts direct REST API invocation to trigger the Datasphere repository sharing
+        mechanism (mirroring the UI 'Share Local Table' dialog) using the OAuth access token.
+        """
+        if not self.access_token or not self.consumer_spaces:
+            return False
+
+        endpoints = [
+            f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/localtables/{table_name}/shares",
+            f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}/shares",
+            f"{self.host}/api/v1/datasphere/spaces/{self.source_space}/localtables/{table_name}/shares",
+            f"{self.host}/api/v1/datasphere/spaces/{self.source_space}/shares"
+        ]
+
+        payloads = [
+            {"targetSpaces": self.consumer_spaces, "access": "Read"},
+            {"spaces": self.consumer_spaces, "access": "Read"},
+            {"space": self.consumer_spaces[0], "access": "Read"} if len(self.consumer_spaces) == 1 else {"spaces": self.consumer_spaces}
+        ]
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+
+        # Attempt to obtain CSRF token
+        try:
+            head_req = urllib.request.Request(f"{self.host}/dwaas-core/api/v1/spaces/{self.source_space}", method="GET")
+            head_req.add_header("Authorization", f"Bearer {self.access_token}")
+            head_req.add_header("x-csrf-token", "fetch")
+            with urllib.request.urlopen(head_req, timeout=10) as r:
+                csrf_token = r.headers.get("x-csrf-token")
+                cookies = r.headers.get_all("set-cookie") or []
+                if csrf_token and csrf_token.lower() != "required":
+                    headers["x-csrf-token"] = csrf_token
+                if cookies:
+                    headers["Cookie"] = "; ".join([c.split(";")[0] for c in cookies])
+        except Exception:
+            pass
+
+        for ep in endpoints:
+            for p in payloads:
+                try:
+                    data = json.dumps(p).encode("utf-8")
+                    req = urllib.request.Request(ep, data=data, method="POST", headers=headers)
+                    with urllib.request.urlopen(req, timeout=10) as res:
+                        if res.status in (200, 201, 204):
+                            log("SHARE_API", f"Successfully shared '{table_name}' via API endpoint: {ep}")
+                            return True
+                except urllib.error.HTTPError:
+                    continue
+                except Exception:
+                    continue
+
+        return False
+
     # -------------------------------------------------------------------------
     # STEP 10: Share Local Tables to Consumer Space(s)
     # -------------------------------------------------------------------------
@@ -1136,6 +1194,12 @@ class ReplicationOrchestrator:
 
             # Format B: At the CSN root level (csn.sharing.LocalTable)
             table_csn["sharing"] = {
+                table_name: {
+                    "targetSpaces": self.consumer_spaces
+                },
+                delta_table_name: {
+                    "targetSpaces": self.consumer_spaces
+                },
                 "LocalTable": [{"targetSpaces": self.consumer_spaces}],
                 table_name: [{"targetSpaces": self.consumer_spaces}],
                 delta_table_name: [{"targetSpaces": self.consumer_spaces}]
@@ -1143,8 +1207,13 @@ class ReplicationOrchestrator:
 
             share_csn_path = self._write_json(f"{table_name}_share_csn", table_csn)
 
-            # 3. Update the Local Table with sharing configuration
-            log("STEP 10", f"Updating Local Table '{table_name}' with sharing to '{', '.join(self.consumer_spaces)}'...")
+            # 3. Try direct REST API share endpoint (matching the UI dialog)
+            api_shared = self._api_share_table(table_name)
+            if api_shared:
+                log("STEP 10", f"Direct REST API share for '{table_name}' succeeded.")
+
+            # 4. Update the Local Table with sharing configuration via CLI
+            log("STEP 10", f"Updating Local Table '{table_name}' with sharing to '{', '.join(self.consumer_spaces)}' via CLI...")
             r_update = run_cmd(["datasphere", "objects", "local-tables", "update",
                                 "--space", self.source_space,
                                 "--technical-name", table_name,
