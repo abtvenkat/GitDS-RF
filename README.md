@@ -25,11 +25,13 @@ flowchart TD
 ---
 
 > [!IMPORTANT]
-> **Data Lake File Storage Type Spaces (`HDL_FILES` / `DWC_HDLF`):**
-> If your Datasphere space uses **Data Lake File storage type**, target data is stored as **Delta Lake / Parquet files** in SAP HANA Data Lake Files (`DWC_HDLF`).
-> - **Standard relational Local Tables are NOT used or created** in an HDL_FILES space; they do not appear under the "Local Tables" tab in Data Builder.
-> - Instead, target entities are created as **Delta Lake file entities** (`@DataWarehouse.persistence.hdlf.tableFormat: DELTA_LAKE`) embedded directly in the CSN document.
-> - The files are stored in the Data Lake Files container under `/<space_name>/<target_entity_name>/`.
+> **Data Lake File Storage Type Spaces (`HDL_FILES` / `DWC_HDLF`) & Target Local Tables:**
+> In Data Lake File storage type spaces, target data is stored as **Delta Lake / Parquet files** in SAP HANA Data Lake Files (`DWC_HDLF`).
+> - The pipeline creates and deploys **Local Table CSN entities** directly into your space before replication flow creation:
+>   - **Active Entity `<VIEW>`:** Configured with `@DataWarehouse.delta: {type: ACTIVE}` and `@DataWarehouse.persistence.hdlf.tableFormat: DELTA_LAKE`.
+>   - **Delta Entity `<VIEW>_Delta`:** Configured with `@DataWarehouse.delta: {type: UPSERT}`, extraction parameters (`EXTRACTION_MODE`, `FROM_VERSION`, `TILL_VERSION`), and CDC columns (`Change_Type`, `Change_Date`).
+> - All column definitions parse and preserve source metadata (`nativeType` length/precision/scale and `TemplateType` date/time/timestamp).
+> - Target objects in the Replication Flow bind directly to `<VIEW>_Delta` (`isNew: false`, `container: ""`).
 
 ---
 
@@ -91,9 +93,9 @@ To guarantee 100% deployment reliability and target entity persistence in Data L
 | **1** | **Authenticate using Datasphere technical user** | Headless OAuth2 client credentials pre-fetch & `@sap/datasphere-cli login` |
 | **2** | **Create or update Replication Flow** | Checks space for existing technical name & initializes consolidated flow |
 | **3** | **Configure source objects** | Maps source CDS view columns, keys, and extraction container |
-| **4** | **Configure target Delta Lake objects** | Configures Delta Lake targets (`isNew: true`) in container `/<space_name>` |
-| **5** | **Save Replication Flow draft** | Initial save with `--no-deploy` to create flow and register target objects |
-| **6** | **Save again to persist target objects (Mandatory)** | Mandatory second save (`--no-deploy`) to commit & persist newly created target objects |
+| **4** | **Deploy target Local Tables (CSN)** | Generates and deploys Delta Lake Local Tables (`<VIEW>` and `<VIEW>_Delta`) with parsed source metadata into Datasphere space |
+| **5** | **Save Replication Flow draft** | Binds flow tasks to target objects (`<VIEW>_Delta`, `isNew: false`) with `--no-deploy` |
+| **6** | **Save again to persist target objects (Mandatory)** | Mandatory second save (`--no-deploy`) with server-read fallback to validate target persistence |
 | **7** | **Deploy Replication Flow** | Deploys flow and active bindings via `update` (with `--deploy-anyway` fallback) |
 | **8** | **Execute Replication Flow** | Triggers execution task via `datasphere tasks replication-flows run` |
 | **9** | **Monitor replication status** | Polls `datasphere tasks replication-flows status` until `COMPLETED` |

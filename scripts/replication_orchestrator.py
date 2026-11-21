@@ -69,7 +69,7 @@ class ReplicationOrchestrator:
         self.target_conn = os.getenv("TARGET_CONNECTION", "DWC_HDLF").strip()
         self.load_type = os.getenv("LOAD_TYPE", "INITIAL").strip().upper()
         self.flow_prefix = os.getenv("FLOW_PREFIX", "RF_").strip()
-        self.table_prefix = os.getenv("TABLE_PREFIX", "LT_").strip()
+        self.table_prefix = os.getenv("TABLE_PREFIX", "").strip()
         self.custom_flow_name = os.getenv("FLOW_NAME", "").strip() or os.getenv("REPLICATION_FLOW_NAME", "").strip()
 
         self.poll_interval = int(os.getenv("STATUS_POLL_INTERVAL_SEC", "15"))
@@ -276,115 +276,204 @@ class ReplicationOrchestrator:
         return vtypes
 
     # -------------------------------------------------------------------------
-    # STEP 3 & STEP 4: Configure source objects & Generate target Local Tables
+    # STEP 3 & STEP 4: Configure Source Objects & Deploy Target Local Tables
     # -------------------------------------------------------------------------
+    def _build_column_metadata(self, cname: str, vtype_id: str, business_name: str = "") -> dict:
+        """
+        Parses source column data type and semantics to construct the exact
+        nativeType and TemplateType metadata structure expected by SAP Datasphere.
+        """
+        meta = {}
+        native_type = {}
+
+        if vtype_id.startswith("$DYNAMIC.string_"):
+            try:
+                length = int(vtype_id.split("_", 1)[1])
+                native_type = {"datatype": "string", "length": length}
+            except (ValueError, IndexError):
+                native_type = {"datatype": "string", "length": 50}
+        elif vtype_id.startswith("$DYNAMIC.decimal_"):
+            parts = vtype_id.split("_")
+            try:
+                native_type = {"datatype": "decimal", "precision": int(parts[1]), "scale": int(parts[2])}
+            except (ValueError, IndexError):
+                native_type = {"datatype": "decimal", "precision": 15, "scale": 3}
+        elif vtype_id.startswith("$DYNAMIC.int_") or "int" in vtype_id:
+            native_type = {"datatype": "int"}
+        elif vtype_id == "com.sap.core.timestamp":
+            native_type = {"datatype": "timestamp"}
+        elif vtype_id == "com.sap.core.date":
+            native_type = {"datatype": "date"}
+
+        if native_type:
+            meta["nativeType"] = native_type
+
+        # Parse date, time, and timestamp semantics from column name and type
+        cname_lower = cname.lower()
+        if (cname_lower.endswith("datetime") or cname_lower.endswith("_datetime")
+                or vtype_id == "com.sap.core.timestamp" or cname == "Change_Date"):
+            meta["TemplateType"] = {"datatype": "timestamp"}
+        elif (cname_lower.endswith("date") or cname_lower.endswith("_date")
+              or vtype_id == "com.sap.core.date"):
+            meta["TemplateType"] = {"datatype": "date"}
+        elif cname_lower.endswith("time") or cname_lower.endswith("_time"):
+            meta["TemplateType"] = {"datatype": "time"}
+
+        return meta
+
     def get_cds_view_schema(self, view_name: str, table_name: str) -> tuple:
+        """
+        Configures source object columns, keys, and target object columns with metadata.
+        All column definitions include parsed nativeType and TemplateType metadata.
+        """
         v = view_name.upper()
         if v == "I_CURRENCY":
             keys = ["Currency"]
-            source_cols = [
-                {"name": "Currency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_5", "key": True, "businessName": "Currency", "metadata": {}},
-                {"name": "Decimals", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "businessName": "Decimals", "metadata": {}},
-                {"name": "CurrencyISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "businessName": "ISO Currency Code", "metadata": {}},
-                {"name": "AlternativeCurrencyKey", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "businessName": "Alternative Currency Key", "metadata": {}},
-                {"name": "IsPrimaryCurrencyForISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Primary Currency", "metadata": {}}
+            raw_cols = [
+                {"name": "Currency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_5", "key": True, "businessName": "Currency"},
+                {"name": "Decimals", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "businessName": "Decimals"},
+                {"name": "CurrencyISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "businessName": "ISO Currency Code"},
+                {"name": "AlternativeCurrencyKey", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_3", "businessName": "Alternative Currency Key"},
+                {"name": "IsPrimaryCurrencyForISOCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Primary Currency"}
             ]
         elif v == "I_CURRENCYTEXT":
             keys = ["Language", "Currency"]
-            source_cols = [
-                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key", "metadata": {}},
-                {"name": "Currency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_5", "key": True, "businessName": "Currency", "metadata": {}},
-                {"name": "CurrencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Currency Name", "metadata": {}},
-                {"name": "CurrencyShortName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_15", "businessName": "Short text", "metadata": {}}
+            raw_cols = [
+                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key"},
+                {"name": "Currency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_5", "key": True, "businessName": "Currency"},
+                {"name": "CurrencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Currency Name"},
+                {"name": "CurrencyShortName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_15", "businessName": "Short text"}
+            ]
+        elif v == "I_SALESORGANIZATION":
+            keys = ["SalesOrganization"]
+            raw_cols = [
+                {"name": "SalesOrganization", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_4", "key": True, "businessName": "Sales organization"},
+                {"name": "SalesOrganizationCurrency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_5", "businessName": "Statistics currency"},
+                {"name": "CompanyCode", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_4", "businessName": "Company code of the sales organization"},
+                {"name": "IntercompanyBillingCustomer", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Customer number for intercompany billing"},
+                {"name": "ArgentinaDeliveryDateEvent", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Time of numbering for deliveries"},
+                {"name": "AddressID", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Address"},
+                {"name": "VATRegnNumberDeterminationRule", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Rule that determines the vat registration number (vat id)"}
+            ]
+        elif v == "Z_ADLC_SALESORDERITEMPARTNER_W":
+            keys = ["SalesOrder", "SalesOrderItem", "PartnerFunction"]
+            raw_cols = [
+                {"name": "SalesOrder", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "key": True, "businessName": "Sales order"},
+                {"name": "SalesOrderItem", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_6", "key": True, "businessName": "Sales order item"},
+                {"name": "PartnerFunction", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Partner function"},
+                {"name": "Customer", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Customer number"},
+                {"name": "Supplier", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Account number of supplier"},
+                {"name": "Personnel", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_8", "businessName": "Personnel number"},
+                {"name": "ContactPerson", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Number of contact person"},
+                {"name": "Partner", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Customer number"},
+                {"name": "FullName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_80", "businessName": "Full name of person"},
+                {"name": "ReferenceBusinessPartner", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Business partner number"},
+                {"name": "AddressID", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Address number"},
+                {"name": "AddressPersonID", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Person number"},
+                {"name": "AddressObjectType", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Address type (1=organization, 2=person, 3=contact person)"},
+                {"name": "SDDocPartnerAddressRefType", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "businessName": "Address indicator"},
+                {"name": "BPAddrDeterminationTransaction", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_6", "businessName": "Address determination in document"},
+                {"name": "BPRefAddressIDForDocSpcfcAddr", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "businessName": "Bp reference address number"},
+                {"name": "InternationalPhoneNumber", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_30", "businessName": "Complete number: dialing code+number+extension"},
+                {"name": "InternationalMobilePhoneNumber", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_30", "businessName": "Complete number: dialing code+number+extension"},
+                {"name": "EmailAddress", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_241", "businessName": "Email address"}
             ]
         elif v in ("I_BILLINGFREQUENCY", "BILLINGFREQUENCY"):
             keys = ["BillingFrequency"]
-            source_cols = [
-                {"name": "BillingFrequency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "key": True, "businessName": "Billing Frequency", "metadata": {}}
+            raw_cols = [
+                {"name": "BillingFrequency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "key": True, "businessName": "Billing Frequency"}
             ]
         elif v in ("I_BILLINGFREQUENCY_TEXT", "I_BILLINGFREQUENCYTEXT", "BILLINGFREQUENCY_TEXT", "BILLINGFREQUENCYTEXT"):
             keys = ["Language", "BillingFrequency"]
-            source_cols = [
-                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key", "metadata": {}},
-                {"name": "BillingFrequency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "key": True, "businessName": "Billing Frequency", "metadata": {}},
-                {"name": "BillingFrequencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Billing Frequency Name", "metadata": {}}
+            raw_cols = [
+                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key"},
+                {"name": "BillingFrequency", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_10", "key": True, "businessName": "Billing Frequency"},
+                {"name": "BillingFrequencyName", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": "Billing Frequency Name"}
             ]
         elif v.endswith("_TEXT") or v.endswith("TEXT"):
             base_name = v[:-5] if v.endswith("_TEXT") else v[:-4]
             entity_name = base_name[2:] if base_name.startswith("I_") or base_name.startswith("C_") else base_name
             keys = ["Language", entity_name]
-            source_cols = [
-                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key", "metadata": {}},
-                {"name": entity_name, "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50", "key": True, "businessName": entity_name, "metadata": {}},
-                {"name": f"{entity_name}Name", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": f"{entity_name} Name", "metadata": {}}
+            raw_cols = [
+                {"name": "Language", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_2", "key": True, "businessName": "Language Key"},
+                {"name": entity_name, "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50", "key": True, "businessName": entity_name},
+                {"name": f"{entity_name}Name", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_40", "businessName": f"{entity_name} Name"}
             ]
         else:
             entity_name = v[2:] if v.startswith("I_") or v.startswith("C_") else v
             keys = [entity_name]
-            source_cols = [
+            raw_cols = [
                 {"name": entity_name, "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_50",
-                 "key": True, "businessName": entity_name, "metadata": {}}
+                 "key": True, "businessName": entity_name}
             ]
 
+        # Parse and assign metadata for all source columns
+        source_cols = []
+        for col in raw_cols:
+            col_def = dict(col)
+            col_def["metadata"] = self._build_column_metadata(
+                col_def["name"], col_def.get("vtype-ID", ""), col_def.get("businessName", "")
+            )
+            source_cols.append(col_def)
+
+        # Build target columns: all source columns + Change_Type + Change_Date
         target_cols = [dict(c) for c in source_cols] + [
-            {"name": "Change_Type", "vflow.type": "scalar", "vtype-ID": "$DYNAMIC.string_1", "metadata": {}},
-            {"name": "Change_Date", "vflow.type": "scalar", "vtype-ID": "com.sap.core.timestamp", "metadata": {}}
+            {
+                "name": "Change_Type",
+                "vflow.type": "scalar",
+                "vtype-ID": "$DYNAMIC.string_1",
+                "businessName": "Change_Type",
+                "metadata": {"nativeType": {"datatype": "string", "length": 1}}
+            },
+            {
+                "name": "Change_Date",
+                "vflow.type": "scalar",
+                "vtype-ID": "com.sap.core.timestamp",
+                "businessName": "Change_Date",
+                "metadata": {"TemplateType": {"datatype": "timestamp"}}
+            }
         ]
         target_dict_elems = {col["name"]: {} for col in target_cols}
         return source_cols, keys, target_cols, target_dict_elems
 
     # -------------------------------------------------------------------------
-    # STEP 2, 3, 4: Build Consolidated Flow with Source and Target Definitions
+    # STEP 2, 3, 4: Build Definitions, Deploy Local Tables, & Build RF JSON
     # -------------------------------------------------------------------------
     def build_definitions(self, views: list) -> dict:
         """
         Builds standard CSN entity definitions for Delta Lake targets in HDL_FILES space.
-        These definitions are embedded into the root of the Replication Flow CSN payload
-        so SAP Datasphere compiles and creates the target Delta Lake entities in Data Lake Files.
-        Also saved to reports/local_tables_csn.json for reference.
+        Matches the exact schema format exported from SAP Datasphere (e.g. Z_ADLC_SALESORDERITEMPARTNER_W):
+          - Active entity: <TABLE_NAME> with deltaFromEntities: [<TABLE_NAME>_Delta]
+          - Delta entity: <TABLE_NAME>_Delta with UPSERT mode, params, Semantics.interval, and CDC fields.
         """
         definitions = {}
         for view in views:
-            table_name = f"{self.table_prefix}{view}"
+            table_name = f"{self.table_prefix}{view}" if self.table_prefix else view
+            delta_table_name = f"{table_name}_Delta"
             source_cols, keys, target_cols, _ = self.get_cds_view_schema(view, table_name)
-            elements = {}
-            for col in target_cols:
+
+            # Build source elements
+            source_elements = {}
+            for col in source_cols:
                 cname = col["name"]
                 vtype = col.get("vtype-ID", "")
                 is_key = col.get("key", False)
+                meta = col.get("metadata", {})
+                nt = meta.get("nativeType", {})
+                tt = meta.get("TemplateType", {})
 
-                if cname == "Change_Type":
-                    elements[cname] = {
-                        "@EndUserText.label": "Change_Type",
-                        "type": "cds.String",
-                        "key": False,
-                        "notNull": True,
-                        "length": 1,
-                        "default": {"val": "I"}
-                    }
-                    continue
-                if cname == "Change_Date":
-                    elements[cname] = {
-                        "@EndUserText.label": "Change_Date",
-                        "type": "cds.Timestamp",
-                        "key": False,
-                        "notNull": True,
-                        "default": {"func": "CURRENT_UTCTIMESTAMP"}
-                    }
-                    continue
-
-                if "string" in vtype:
-                    try:
-                        length = int(vtype.split("_")[-1])
-                    except (IndexError, ValueError):
-                        length = 50
+                if "string" in vtype or nt.get("datatype") == "string":
+                    length = nt.get("length") or 50
                     elem_def = {"type": "cds.String", "length": length}
-                elif "decimal" in vtype:
-                    parts = vtype.split("_")
-                    elem_def = {"type": "cds.Decimal", "precision": int(parts[1]), "scale": int(parts[2])}
-                elif "timestamp" in vtype:
+                elif "decimal" in vtype or nt.get("datatype") == "decimal":
+                    p = nt.get("precision", 15)
+                    s = nt.get("scale", 3)
+                    elem_def = {"type": "cds.Decimal", "precision": p, "scale": s}
+                elif "timestamp" in vtype or tt.get("datatype") == "timestamp":
                     elem_def = {"type": "cds.Timestamp"}
-                elif "int" in vtype:
+                elif "date" in vtype or tt.get("datatype") == "date":
+                    elem_def = {"type": "cds.Date"}
+                elif "int" in vtype or nt.get("datatype") == "int":
                     elem_def = {"type": "cds.Integer"}
                 else:
                     elem_def = {"type": "cds.String", "length": 50}
@@ -396,9 +485,47 @@ class ReplicationOrchestrator:
                     elem_def["key"] = False
                 if col.get("businessName"):
                     elem_def["@EndUserText.label"] = col["businessName"]
-                elements[cname] = elem_def
+                source_elements[cname] = elem_def
 
+            # Build delta elements (source + Change_Type + Change_Date)
+            delta_elements = dict(source_elements)
+            delta_elements["Change_Type"] = {
+                "@EndUserText.label": "Change_Type",
+                "type": "cds.String",
+                "key": False,
+                "notNull": True,
+                "length": 1,
+                "default": {"val": "I"}
+            }
+            delta_elements["Change_Date"] = {
+                "@EndUserText.label": "Change_Date",
+                "type": "cds.Timestamp",
+                "key": False,
+                "notNull": True,
+                "default": {"func": "CURRENT_UTCTIMESTAMP"}
+            }
+
+            # 1. Active entity: <TABLE_NAME>
             definitions[table_name] = {
+                "kind": "entity",
+                "@EndUserText.label": f"Local Table for {view}",
+                "@ObjectModel.modelingPattern": {"#": "DATA_STRUCTURE"},
+                "@ObjectModel.supportedCapabilities": [{"#": "DATA_STRUCTURE"}],
+                "@DataWarehouse.delta": {
+                    "type": {"#": "ACTIVE"},
+                    "deltaFromEntities": [delta_table_name]
+                },
+                "@DataWarehouse.persistence.hdlf.tableFormat": {"#": "DELTA_LAKE"},
+                "elements": source_elements,
+                "_meta": {
+                    "dependencies": {
+                        "folderAssignment": None
+                    }
+                }
+            }
+
+            # 2. Delta entity: <TABLE_NAME>_Delta
+            definitions[delta_table_name] = {
                 "kind": "entity",
                 "@EndUserText.label": f"Delta Lake Entity for {view}",
                 "@ObjectModel.modelingPattern": {"#": "DATA_STRUCTURE"},
@@ -408,10 +535,38 @@ class ReplicationOrchestrator:
                     "dateTimeElement": {"=": "Change_Date"},
                     "modeElement": {"=": "Change_Type"}
                 },
-                "@DataWarehouse.enclosingObject": view,
+                "@DataWarehouse.enclosingObject": table_name,
+                "params": {
+                    "EXTRACTION_MODE": {
+                        "@EndUserText.label": "Extraction Mode",
+                        "type": "cds.String",
+                        "length": 10,
+                        "default": "FULL",
+                        "@DataWarehouse.bw.extractionMode": True
+                    },
+                    "FROM_VERSION": {
+                        "@EndUserText.label": "From Change Version",
+                        "type": "cds.Integer64",
+                        "default": "-1"
+                    },
+                    "TILL_VERSION": {
+                        "@EndUserText.label": "Till Change Version",
+                        "type": "cds.Integer64",
+                        "default": "-1"
+                    }
+                },
+                "@Semantics.interval": [
+                    {
+                        "qualifier": "changeVersion",
+                        "lowerBoundaryParameter": {"=": "FROM_VERSION"},
+                        "lowerBoundaryIncluded": True,
+                        "upperBoundaryParameter": {"=": "TILL_VERSION"},
+                        "upperBoundaryIncluded": True
+                    }
+                ],
                 "@DataWarehouse.persistence.hdlf.tableFormat": {"#": "DELTA_LAKE"},
                 "@cds.persistence.udf": True,
-                "elements": elements,
+                "elements": delta_elements,
                 "_meta": {
                     "dependencies": {
                         "folderAssignment": None
@@ -419,7 +574,12 @@ class ReplicationOrchestrator:
                 }
             }
 
-        csn_payload = {"$version": "1.0", "definitions": definitions}
+        csn_payload = {
+            "$version": "1.0",
+            "version": {"csn": "1.0"},
+            "meta": {"creator": "CDS Compiler v1.19.2"},
+            "definitions": definitions
+        }
         csn_path = self.report_dir / "local_tables_csn.json"
         with open(csn_path, "w", encoding="utf-8") as f:
             json.dump(csn_payload, f, indent=2)
@@ -431,23 +591,89 @@ class ReplicationOrchestrator:
         self.build_definitions(views)
         return self.report_dir / "local_tables_csn.json"
 
-    def build_consolidated_flow_json(self, flow_name: str, views: list, is_new: bool = True) -> dict:
+    def deploy_local_tables(self, views: list) -> bool:
+        """
+        Step 4: Generates target Local Table Delta Lake definitions (CSN) and deploys
+        them into the SAP Datasphere space via `datasphere objects local-tables create/update`.
+        """
+        definitions = self.build_definitions(views)
+        all_success = True
+
+        for view in views:
+            table_name = f"{self.table_prefix}{view}" if self.table_prefix else view
+            delta_table_name = f"{table_name}_Delta"
+
+            table_csn = {
+                "$version": "1.0",
+                "version": {"csn": "1.0"},
+                "meta": {"creator": "CDS Compiler v1.19.2"},
+                "definitions": {
+                    table_name: definitions[table_name],
+                    delta_table_name: definitions[delta_table_name]
+                }
+            }
+            table_csn_path = self._write_json(f"{table_name}_csn", table_csn)
+
+            log("STEP 4", f"Checking if Local Table '{table_name}' exists in space '{self.source_space}'...")
+            r_check = run_cmd(["datasphere", "objects", "local-tables", "read",
+                               "--space", self.source_space,
+                               "--technical-name", table_name,
+                               "--secrets-file", str(self.secrets_path),
+                               "--host", self.host])
+            exists = (r_check.returncode == 0)
+            action = "update" if exists else "create"
+
+            log("STEP 4", f"{action.capitalize()} Local Table '{table_name}' in space '{self.source_space}'...")
+            r_table = run_cmd(["datasphere", "objects", "local-tables", action,
+                               "--space", self.source_space,
+                               "--technical-name", table_name,
+                               "--file-path", str(table_csn_path),
+                               "--secrets-file", str(self.secrets_path),
+                               "--host", self.host])
+            if r_table.returncode != 0 and not exists:
+                log("STEP 4", f"Create returned notice ({r_table.stderr or r_table.stdout}). Retrying with update...", "WARN")
+                r_table = run_cmd(["datasphere", "objects", "local-tables", "update",
+                                   "--space", self.source_space,
+                                   "--technical-name", table_name,
+                                   "--file-path", str(table_csn_path),
+                                   "--secrets-file", str(self.secrets_path),
+                                   "--host", self.host])
+
+            if r_table.returncode != 0:
+                log("STEP 4", f"Save notice ({r_table.stderr or r_table.stdout}). Retrying with --save-anyway...", "WARN")
+                r_table = run_cmd(["datasphere", "objects", "local-tables", "update",
+                                   "--space", self.source_space,
+                                   "--technical-name", table_name,
+                                   "--file-path", str(table_csn_path),
+                                   "--secrets-file", str(self.secrets_path),
+                                   "--host", self.host,
+                                   "--save-anyway"])
+
+            if r_table.returncode == 0:
+                log("STEP 4", f"Local Table '{table_name}' and '{delta_table_name}' successfully deployed to space '{self.source_space}'.")
+            else:
+                log("STEP 4", f"Notice while deploying Local Table '{table_name}': {r_table.stderr or r_table.stdout}. Proceeding with flow creation...", "WARN")
+
+        return all_success
+
+    def build_consolidated_flow_json(self, flow_name: str, views: list, is_new: bool = False, include_definitions: bool = False) -> dict:
         """
         Builds a SINGLE Replication Flow JSON containing all CDS Views as separate replication tasks.
         Step 3: Configures source objects.
-        Step 4: Generates target objects in Data Lake Files (HDL_FILES / DWC_HDLF).
+        Step 4: Configures target objects in Data Lake Files (HDL_FILES / DWC_HDLF).
         """
         target_conn_id = self.target_conn if self.target_conn not in ("DATASPHERE_LOCAL", "", None) else "DWC_HDLF"
         target_conn_type = "HDL_FILES" if target_conn_id == "DWC_HDLF" else "DATASPHERE"
         source_container = f"/{self.source_container.lstrip('/')}"
-        target_container = os.getenv("TARGET_CONTAINER", "").strip() or (f"/{self.source_space.lstrip('/')}" if target_conn_type == "HDL_FILES" else "")
+        target_container = ""  # For HDL_FILES (DWC_HDLF), container is always empty string
 
         all_cols = []
         replication_tasks = []
         targets = {}
 
         for idx, view in enumerate(views, start=1):
-            table_name = f"{self.table_prefix}{view}"
+            table_name = f"{self.table_prefix}{view}" if self.table_prefix else view
+            delta_table_name = f"{table_name}_Delta"
             source_cols, keys, target_cols, target_dict_elems = self.get_cds_view_schema(view, table_name)
             all_cols.extend(source_cols)
             all_cols.extend(target_cols)
@@ -465,9 +691,9 @@ class ReplicationOrchestrator:
                     "businessName": view
                 },
                 "targetObject": {
-                    "name": table_name,
+                    "name": delta_table_name,
                     "definition": {"columns": target_cols, "keys": keys},
-                    "metadata": {"isNew": is_new},  # True on initial creation so Datasphere generates targets
+                    "metadata": {"isNew": is_new},
                     "properties": {
                         "com.sap.datasuite.cdc.mode.column": "Change_Type",
                         "com.sap.datasuite.cdc.timestamp.column": "Change_Date",
@@ -477,7 +703,7 @@ class ReplicationOrchestrator:
                 }
             }
             replication_tasks.append(task_def)
-            targets[table_name] = {"elements": target_dict_elems}
+            targets[delta_table_name] = {"elements": target_dict_elems}
 
         vtypes_scalar = self._build_vtypes(all_cols)
 
@@ -526,7 +752,17 @@ class ReplicationOrchestrator:
             "connections": {self.source_conn: {}}
         }
 
-        return {"replicationflows": {flow_name: flow_body}}
+        if include_definitions:
+            definitions = self.build_definitions(views)
+            return {
+                "$version": "1.0",
+                "version": {"csn": "1.0"},
+                "meta": {"creator": "CDS Compiler v1.19.2"},
+                "definitions": definitions,
+                "replicationflows": {flow_name: flow_body}
+            }
+        else:
+            return {"replicationflows": {flow_name: flow_body}}
 
     def _write_json(self, name: str, data: dict) -> Path:
         path = Path(self.temp_dir.name) / f"{name}.json"
@@ -579,12 +815,12 @@ class ReplicationOrchestrator:
     # -------------------------------------------------------------------------
     def create_or_update_flow(self, flow_name: str, views: list) -> bool:
         """
-        Executes the official SAP 9-Step Automation Sequence for HDL_FILES spaces:
+        Executes the official SAP 9-Step Automation Sequence for HDL_FILES spaces (Approach A):
           Step 2: Check flow existence
           Step 3: Configure source objects
-          Step 4: Generate target Delta Lake definitions & CSN payload
+          Step 4: Generate target Local Tables (CSN) and deploy to Datasphere space
           Step 5: Save Replication Flow draft (--no-deploy)
-          Step 6: Save again to persist newly created target objects (Mandatory validation)
+          Step 6: Save again to persist target objects (Mandatory validation)
           Step 7: Deploy Replication Flow
         """
         # Step 2: Check flow existence
@@ -596,30 +832,49 @@ class ReplicationOrchestrator:
         log("STEP 3", f"Configuring source objects for {len(views)} CDS views ({', '.join(views)})...")
         self.step_status["step3"] = "PASSED"
 
-        # Step 4: Generate target Delta Lake definitions & build consolidated payload
-        log("STEP 4", f"Generating target Delta Lake definitions (CSN) for {len(views)} views in HDL_FILES space...")
-        self.generate_local_tables_csn(views)
-        payload = self.build_consolidated_flow_json(flow_name, views, is_new=True)
-        flow_file = self._write_json(f"{flow_name}_consolidated", payload)
+        # Step 4: Generate target Local Tables & deploy them to Datasphere space
+        log("STEP 4", f"Deploying target Local Tables (CSN) for {len(views)} views into space '{self.source_space}'...")
+        self.deploy_local_tables(views)
         self.step_status["step4"] = "PASSED"
+
+        # Prepare payloads: Full CSN and Minimal RF
+        payload_full = self.build_consolidated_flow_json(flow_name, views, is_new=False, include_definitions=True)
+        payload_minimal = self.build_consolidated_flow_json(flow_name, views, is_new=False, include_definitions=False)
+
+        flow_file_full = self._write_json(f"{flow_name}_full", payload_full)
+        flow_file_min = self._write_json(f"{flow_name}_min", payload_minimal)
+        active_flow_file = flow_file_min
 
         # ---------------------------------------------------------------------
         # STEP 5: Save Replication Flow draft (initial save to register targets)
         # ---------------------------------------------------------------------
         action = "update" if exists else "create"
         log("STEP 5", f"Save Replication Flow '{flow_name}' draft (--no-deploy)...")
-        r1 = self._rf_cmd(action, flow_name, flow_file, ["--no-deploy"])
+
+        # Try with minimal payload first (standard CLI replication-flow object format)
+        r1 = self._rf_cmd(action, flow_name, active_flow_file, ["--no-deploy"])
         if r1.returncode != 0 and not exists:
             log("STEP 5", f"Create returned notice ({r1.stderr or r1.stdout}). Retrying with update...", "WARN")
-            r1 = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy"])
+            r1 = self._rf_cmd("update", flow_name, active_flow_file, ["--no-deploy"])
+
+        if r1.returncode != 0:
+            log("STEP 5", "Retrying draft save with full CSN payload...", "INFO")
+            r1 = self._rf_cmd("update" if exists else action, flow_name, flow_file_full, ["--no-deploy"])
+            if r1.returncode == 0:
+                active_flow_file = flow_file_full
 
         if r1.returncode != 0:
             log("STEP 5", f"Save notice ({r1.stderr or r1.stdout}). Retrying with --save-anyway...", "WARN")
-            r1 = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy", "--save-anyway"])
-            if r1.returncode != 0:
-                self.step_status["step5"] = "FAILED"
-                log("STEP 5", f"Failed Step 5 save for flow '{flow_name}': {r1.stderr or r1.stdout}", "ERROR")
-                return False
+            r1 = self._rf_cmd("update", flow_name, active_flow_file, ["--no-deploy", "--save-anyway"])
+            if r1.returncode != 0 and active_flow_file != flow_file_full:
+                r1 = self._rf_cmd("update", flow_name, flow_file_full, ["--no-deploy", "--save-anyway"])
+                if r1.returncode == 0:
+                    active_flow_file = flow_file_full
+
+        if r1.returncode != 0:
+            self.step_status["step5"] = "FAILED"
+            log("STEP 5", f"Failed Step 5 save for flow '{flow_name}': {r1.stderr or r1.stdout}", "ERROR")
+            return False
 
         self.step_status["step5"] = "PASSED"
         log("STEP 5", f"Replication Flow '{flow_name}' draft saved successfully.")
@@ -629,10 +884,10 @@ class ReplicationOrchestrator:
         # STEP 6: Save again to persist newly created target objects (Mandatory validation)
         # ---------------------------------------------------------------------
         log("STEP 6", f"Save again to persist newly created target objects for '{flow_name}'...")
-        r2 = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy"])
+        r2 = self._rf_cmd("update", flow_name, active_flow_file, ["--no-deploy"])
         if r2.returncode != 0:
             log("STEP 6", f"Notice during Step 6: {r2.stderr or r2.stdout}. Retrying with --save-anyway...", "WARN")
-            r2 = self._rf_cmd("update", flow_name, flow_file, ["--no-deploy", "--save-anyway"])
+            r2 = self._rf_cmd("update", flow_name, active_flow_file, ["--no-deploy", "--save-anyway"])
 
         if r2.returncode != 0:
             log("STEP 6", "Direct second save returned notice. Fetching server state to persist target objects...", "WARN")
@@ -648,7 +903,7 @@ class ReplicationOrchestrator:
                     file_step6 = self._write_json(f"{flow_name}_step6", patched)
                     r2 = self._rf_cmd("update", flow_name, file_step6, ["--no-deploy", "--save-anyway"])
                     if r2.returncode == 0:
-                        flow_file = file_step6
+                        active_flow_file = file_step6
                 except Exception as ex:
                     log("STEP 6", f"Server payload patch notice: {ex}", "WARN")
 
@@ -665,7 +920,7 @@ class ReplicationOrchestrator:
         # STEP 7: Deploy Replication Flow
         # ---------------------------------------------------------------------
         log("STEP 7", f"Deploy Replication Flow '{flow_name}'...")
-        r_deploy = self._rf_cmd("update", flow_name, flow_file, [])
+        r_deploy = self._rf_cmd("update", flow_name, active_flow_file, [])
         if r_deploy.returncode == 0:
             self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed!")
@@ -674,7 +929,7 @@ class ReplicationOrchestrator:
 
         err = r_deploy.stderr or r_deploy.stdout
         log("STEP 7", f"Standard deploy notice: {err}. Retrying deploy with --deploy-anyway...", "WARN")
-        r_deploy2 = self._rf_cmd("update", flow_name, flow_file, ["--deploy-anyway"])
+        r_deploy2 = self._rf_cmd("update", flow_name, active_flow_file, ["--deploy-anyway"])
         if r_deploy2.returncode == 0:
             self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed with --deploy-anyway!")
@@ -682,7 +937,7 @@ class ReplicationOrchestrator:
             return True
 
         log("STEP 7", f"Notice with --deploy-anyway: {r_deploy2.stderr or r_deploy2.stdout}. Retrying deploy with --save-anyway...", "WARN")
-        r_deploy3 = self._rf_cmd("update", flow_name, flow_file, ["--save-anyway"])
+        r_deploy3 = self._rf_cmd("update", flow_name, active_flow_file, ["--save-anyway"])
         if r_deploy3.returncode == 0:
             self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed with --save-anyway!")
@@ -773,7 +1028,7 @@ class ReplicationOrchestrator:
             f"1. {badge('step1')} Authenticate using Datasphere technical user",
             f"2. {badge('step2')} Create or update Replication Flow",
             f"3. {badge('step3')} Configure source objects",
-            f"4. {badge('step4')} Generate target Delta Lake definitions & configure flow",
+            f"4. {badge('step4')} Generate target Local Tables (CSN) & deploy in space",
             f"5. {badge('step5')} Save Replication Flow draft (--no-deploy)",
             f"6. {badge('step6')} Save again to persist target objects (Mandatory validation)",
             f"7. {badge('step7')} Deploy Replication Flow",
@@ -785,8 +1040,9 @@ class ReplicationOrchestrator:
         ]
 
         for view in views:
-            table_name = f"{self.table_prefix}{view}"
-            lines.append(f"| `{view}` | `{self.flow_name}` | `{table_name}` | `{self.load_type}` | `{flow_status}` |")
+            table_name = f"{self.table_prefix}{view}" if self.table_prefix else view
+            delta_table_name = f"{table_name}_Delta"
+            lines.append(f"| `{view}` | `{self.flow_name}` | `{delta_table_name}` | `{self.load_type}` | `{flow_status}` |")
 
         report_md = "\n".join(lines)
         report_md_path = self.report_dir / "replication_report.md"
