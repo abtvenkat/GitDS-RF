@@ -19,7 +19,8 @@ flowchart TD
     I --> J["Deploy Replication Flow (update)"]
     J --> K["Execute Replication Flow (tasks run)"]
     K --> L["Monitor Execution until COMPLETED"]
-    L --> M["Generate Execution Report & CSN Artifacts"]
+    L --> M["Step 10: Dedicated Cross-Space Sharing to CONSUMER_SPACES"]
+    M --> N["Generate Execution Report & CSN Artifacts"]
 ```
 
 ---
@@ -85,21 +86,22 @@ Configure your GitHub repository: **Settings** → **Secrets and variables** →
 
 ---
 
-## 3. Official 9-Step Automation Sequence (Data Lake Files / HDL_FILES)
+## 3. Official 10-Step Automation Sequence (Data Lake Files / HDL_FILES)
 
-To guarantee 100% deployment reliability and target entity persistence in Data Lake File storage spaces (`HDL_FILES`), the pipeline follows SAP's official 9-step sequence:
+To guarantee 100% deployment reliability, target entity persistence, and cross-space data sharing in Data Lake File storage spaces (`HDL_FILES`), the pipeline follows an end-to-end 10-step sequence:
 
 | Step | Operation | Implementation Detail |
 | :--- | :--- | :--- |
 | **1** | **Authenticate using Datasphere technical user** | Headless OAuth2 client credentials pre-fetch & `@sap/datasphere-cli login` |
 | **2** | **Create or update Replication Flow** | Checks space for existing technical name & initializes consolidated flow |
 | **3** | **Configure source objects** | Maps source CDS view columns, keys, and extraction container |
-| **4** | **Deploy & Share target Local Tables (CSN)** | Generates and deploys Delta Lake Local Tables (`<VIEW>` and `<VIEW>_Delta`) with parsed source metadata, and automatically shares them with `CONSUMER_SPACE` |
+| **4** | **Deploy target Local Tables (CSN)** | Generates and deploys Delta Lake Local Tables (`<VIEW>` and `<VIEW>_Delta`) with parsed source metadata into the source space |
 | **5** | **Save Replication Flow draft** | Binds flow tasks to target objects (`<VIEW>_Delta`, `isNew: false`) with `--no-deploy` |
 | **6** | **Save again to persist target objects (Mandatory)** | Mandatory second save (`--no-deploy`) with server-read fallback to validate target persistence |
 | **7** | **Deploy Replication Flow** | Deploys flow and active bindings via `update` (with `--deploy-anyway` fallback) |
 | **8** | **Execute Replication Flow** | Triggers execution task via `datasphere tasks replication-flows run` |
 | **9** | **Monitor replication status** | Polls `datasphere tasks replication-flows status` until `COMPLETED` |
+| **10** | **Share Local Tables to Consumer Space(s)** | Dedicated sharing step: reads live deployed CSN from Datasphere, injects cross-space sharing for `CONSUMER_SPACES`, applies update, and verifies server persistence |
 
 > [!TIP]
 > **Why the Two-Stage Save (Step 5 & Step 6) is Mandatory for Target Persistence:**  

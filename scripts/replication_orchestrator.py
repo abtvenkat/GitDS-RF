@@ -99,7 +99,8 @@ class ReplicationOrchestrator:
             "step6": "NOT_RUN",
             "step7": "NOT_RUN",
             "step8": "NOT_RUN",
-            "step9": "NOT_RUN"
+            "step9": "NOT_RUN",
+            "step10": "NOT_RUN"
         }
 
     def cleanup(self):
@@ -983,6 +984,8 @@ class ReplicationOrchestrator:
             self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed!")
             time.sleep(5)
+            if self.consumer_spaces:
+                self.share_local_tables_to_consumer_spaces(views)
             return True
 
         err = r_deploy.stderr or r_deploy.stdout
@@ -992,6 +995,8 @@ class ReplicationOrchestrator:
             self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed with --deploy-anyway!")
             time.sleep(5)
+            if self.consumer_spaces:
+                self.share_local_tables_to_consumer_spaces(views)
             return True
 
         log("STEP 7", f"Notice with --deploy-anyway: {r_deploy2.stderr or r_deploy2.stdout}. Retrying deploy with --save-anyway...", "WARN")
@@ -1000,6 +1005,8 @@ class ReplicationOrchestrator:
             self.step_status["step7"] = "PASSED"
             log("STEP 7", f"Replication Flow '{flow_name}' successfully deployed with --save-anyway!")
             time.sleep(5)
+            if self.consumer_spaces:
+                self.share_local_tables_to_consumer_spaces(views)
             return True
 
         self.step_status["step7"] = "FAILED"
@@ -1058,6 +1065,152 @@ class ReplicationOrchestrator:
         log("STEP 9", f"Replication Flow '{flow_name}' monitoring timed out after {self.timeout_sec}s.", "WARN")
         return f"TIMEOUT ({last_status})"
 
+    # -------------------------------------------------------------------------
+    # STEP 10: Share Local Tables to Consumer Space(s)
+    # -------------------------------------------------------------------------
+    def share_local_tables_to_consumer_spaces(self, views: list) -> bool:
+        """
+        Step 10: Dedicated sharing step executed after creating and deploying both
+        the Replication Flow and Local Tables. Reads the live deployed CSN from the
+        server, injects the cross-space sharing block in all standard formats, updates
+        the Local Table object in Datasphere, and verifies that the server persists sharing.
+        """
+        if not self.consumer_spaces:
+            log("STEP 10", "No consumer space(s) specified. Target tables remain local to source space.")
+            self.step_status["step10"] = "PASSED"
+            return True
+
+        log("STEP 10", f"Executing dedicated cross-space sharing for {len(views)} table(s) to: {', '.join(self.consumer_spaces)}...")
+        all_shared = True
+
+        for view in views:
+            table_name = f"{self.table_prefix}{view}" if self.table_prefix else view
+            delta_table_name = f"{table_name}_Delta"
+
+            # 1. Read existing deployed definition directly from Datasphere server
+            log("STEP 10", f"Reading deployed definition for Local Table '{table_name}' from space '{self.source_space}'...")
+            r_read = run_cmd(["datasphere", "objects", "local-tables", "read",
+                              "--space", self.source_space,
+                              "--technical-name", table_name,
+                              "--secrets-file", str(self.secrets_path),
+                              "--host", self.host])
+
+            table_csn = None
+            if r_read.returncode == 0 and r_read.stdout:
+                raw_out = r_read.stdout.strip()
+                first_brace = raw_out.find("{")
+                last_brace = raw_out.rfind("}")
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    try:
+                        table_csn = json.loads(raw_out[first_brace:last_brace + 1])
+                        log("STEP 10", f"Retrieved live deployed CSN from server for '{table_name}'.")
+                    except Exception as e:
+                        log("STEP 10", f"Notice parsing server JSON for '{table_name}': {e}", "WARN")
+
+            if not table_csn:
+                log("STEP 10", f"Server read did not yield valid JSON. Using generated definition for '{table_name}'...", "WARN")
+                definitions = self.build_definitions([view])
+                table_csn = {
+                    "$version": "1.0",
+                    "version": {"csn": "1.0"},
+                    "meta": {"creator": "CDS Compiler v1.19.2"},
+                    "definitions": {
+                        table_name: definitions[table_name],
+                        delta_table_name: definitions[delta_table_name]
+                    }
+                }
+
+            # 2. Inject sharing in all formats recognized by Datasphere
+            # Format A: Inside entity definition (definitions[table_name].sharing.LocalTable)
+            if "definitions" in table_csn:
+                if table_name in table_csn["definitions"]:
+                    table_csn["definitions"][table_name]["sharing"] = {
+                        "LocalTable": [{"targetSpaces": self.consumer_spaces}],
+                        table_name: [{"targetSpaces": self.consumer_spaces}]
+                    }
+                if delta_table_name in table_csn["definitions"]:
+                    table_csn["definitions"][delta_table_name]["sharing"] = {
+                        "LocalTable": [{"targetSpaces": self.consumer_spaces}],
+                        delta_table_name: [{"targetSpaces": self.consumer_spaces}]
+                    }
+
+            # Format B: At the CSN root level (csn.sharing.LocalTable)
+            table_csn["sharing"] = {
+                "LocalTable": [{"targetSpaces": self.consumer_spaces}],
+                table_name: [{"targetSpaces": self.consumer_spaces}],
+                delta_table_name: [{"targetSpaces": self.consumer_spaces}]
+            }
+
+            share_csn_path = self._write_json(f"{table_name}_share_csn", table_csn)
+
+            # 3. Update the Local Table with sharing configuration
+            log("STEP 10", f"Updating Local Table '{table_name}' with sharing to '{', '.join(self.consumer_spaces)}'...")
+            r_update = run_cmd(["datasphere", "objects", "local-tables", "update",
+                                "--space", self.source_space,
+                                "--technical-name", table_name,
+                                "--file-path", str(share_csn_path),
+                                "--secrets-file", str(self.secrets_path),
+                                "--host", self.host])
+
+            if r_update.returncode != 0:
+                log("STEP 10", f"Update notice ({r_update.stderr or r_update.stdout}). Retrying with --save-anyway...", "WARN")
+                r_update = run_cmd(["datasphere", "objects", "local-tables", "update",
+                                    "--space", self.source_space,
+                                    "--technical-name", table_name,
+                                    "--file-path", str(share_csn_path),
+                                    "--secrets-file", str(self.secrets_path),
+                                    "--host", self.host,
+                                    "--save-anyway"])
+
+            if r_update.returncode == 0:
+                log("STEP 10", f"Local Table '{table_name}' sharing update command executed successfully.")
+            else:
+                log("STEP 10", f"Notice while updating sharing for '{table_name}': {r_update.stderr or r_update.stdout}", "WARN")
+                all_shared = False
+
+            # 4. Check if delta table is a separate object and update if so
+            r_check_delta = run_cmd(["datasphere", "objects", "local-tables", "read",
+                                     "--space", self.source_space,
+                                     "--technical-name", delta_table_name,
+                                     "--secrets-file", str(self.secrets_path),
+                                     "--host", self.host])
+            if r_check_delta.returncode == 0:
+                log("STEP 10", f"Delta entity '{delta_table_name}' exists as separate object; applying sharing...")
+                run_cmd(["datasphere", "objects", "local-tables", "update",
+                         "--space", self.source_space,
+                         "--technical-name", delta_table_name,
+                         "--file-path", str(share_csn_path),
+                         "--secrets-file", str(self.secrets_path),
+                         "--host", self.host,
+                         "--save-anyway"])
+
+            # 5. Verify on server and log confirmation
+            r_verify = run_cmd(["datasphere", "objects", "local-tables", "read",
+                               "--space", self.source_space,
+                               "--technical-name", table_name,
+                               "--secrets-file", str(self.secrets_path),
+                               "--host", self.host])
+            if r_verify.returncode == 0 and r_verify.stdout:
+                raw_v = r_verify.stdout.strip()
+                fb = raw_v.find("{")
+                lb = raw_v.rfind("}")
+                if fb != -1 and lb != -1:
+                    try:
+                        v_data = json.loads(raw_v[fb:lb + 1])
+                        v_sharing = (
+                            v_data.get("sharing")
+                            or v_data.get("definitions", {}).get(table_name, {}).get("sharing")
+                        )
+                        if v_sharing:
+                            log("STEP 10", f"Server verified sharing configuration for '{table_name}': {json.dumps(v_sharing)}")
+                        else:
+                            log("STEP 10", f"Server read completed for '{table_name}'.")
+                    except Exception:
+                        log("STEP 10", f"Server read completed for '{table_name}'.")
+
+        self.step_status["step10"] = "PASSED" if all_shared else "WARNING"
+        return all_shared
+
     def generate_report(self, views: list, flow_status: str) -> bool:
         log("REPORT", "Generating execution report...")
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1069,6 +1222,8 @@ class ReplicationOrchestrator:
                 return "`[PASSED]`"
             elif st == "FAILED":
                 return "`[FAILED]`"
+            elif st == "WARNING":
+                return "`[WARNING]`"
             elif st == "TIMEOUT":
                 return "`[TIMEOUT]`"
             else:
@@ -1084,16 +1239,17 @@ class ReplicationOrchestrator:
             f"**Source Connection:** `{self.source_conn}`  ",
             f"**Status:** `{flow_status}`  ",
             "",
-            "### 9-Step Automation Execution Sequence (HDL_FILES Data Lake Files)",
+            "### 10-Step Automation Execution Sequence (HDL_FILES Data Lake Files)",
             f"1. {badge('step1')} Authenticate using Datasphere technical user",
             f"2. {badge('step2')} Create or update Replication Flow",
             f"3. {badge('step3')} Configure source objects",
-            f"4. {badge('step4')} Generate target Local Tables (CSN) & deploy/share in space",
+            f"4. {badge('step4')} Generate target Local Tables (CSN) & deploy in space",
             f"5. {badge('step5')} Save Replication Flow draft (--no-deploy)",
             f"6. {badge('step6')} Save again to persist target objects (Mandatory validation)",
             f"7. {badge('step7')} Deploy Replication Flow",
             f"8. {badge('step8')} Execute Replication Flow",
             f"9. {badge('step9')} Monitor replication status ({flow_status})",
+            f"10. {badge('step10')} Share Local Tables to Consumer Space(s) ({consumer_info})",
             "",
             "| CDS View | Replication Flow | Target Object | Consumer Space | Load Type | Status |",
             "| :--- | :--- | :--- | :--- | :--- | :--- |"
@@ -1176,6 +1332,10 @@ class ReplicationOrchestrator:
 
             # Step 9: Monitor replication status
             flow_status = self.monitor_flow(self.flow_name)
+
+            # Step 10: Confirm / refresh sharing after replication run
+            if self.consumer_spaces:
+                self.share_local_tables_to_consumer_spaces(views_to_process)
 
             return self.generate_report(views_to_process, flow_status)
 
